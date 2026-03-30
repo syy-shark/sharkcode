@@ -150,6 +150,22 @@ async function showSetupFlow(multiConfig: MultiConfig): Promise<SlashResult> {
 }
 
 // ─── Read one line (raw mode kept on by caller; bare "/" triggers immediately) ─
+// ─── Terminal display width (CJK & fullwidth chars occupy 2 columns) ─────────
+function charDisplayWidth(ch: string): number {
+  const cp = ch.codePointAt(0)!;
+  if (
+    (cp >= 0x1100 && cp <= 0x115F) ||   // Hangul Jamo
+    (cp >= 0x2E80 && cp <= 0x303E) ||   // CJK Radicals Supplement, Kangxi, etc.
+    (cp >= 0x3041 && cp <= 0x33FF) ||   // Hiragana, Katakana, CJK Symbols
+    (cp >= 0x3400 && cp <= 0x9FFF) ||   // CJK Unified Ideographs (+ Ext A)
+    (cp >= 0xAC00 && cp <= 0xD7AF) ||   // Hangul Syllables
+    (cp >= 0xF900 && cp <= 0xFAFF) ||   // CJK Compatibility Ideographs
+    (cp >= 0xFF01 && cp <= 0xFF60) ||   // Fullwidth Latin / Punctuation
+    (cp >= 0xFFE0 && cp <= 0xFFE6)      // Fullwidth Signs
+  ) return 2;
+  return 1;
+}
+
 async function readLineRaw(promptStr: string): Promise<string | null> {
   // Raw mode is assumed to already be on. We only manage the data listener.
   process.stdout.write(promptStr);
@@ -188,9 +204,11 @@ async function readLineRaw(promptStr: string): Promise<string | null> {
         if (code === 127 || code === 8) {         // Backspace
           if (buffer.length > 0) {
             const chars = [...buffer];
-            chars.pop();
+            const removed = chars.pop()!;
             buffer = chars.join("");
-            process.stdout.write("\b \b");
+            const w = charDisplayWidth(removed);
+            // Erase `w` columns: move back, blank, move back again
+            process.stdout.write("\b".repeat(w) + " ".repeat(w) + "\b".repeat(w));
           }
           continue;
         }
