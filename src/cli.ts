@@ -255,7 +255,7 @@ async function main() {
   }
 
   if (args[0] === "--version" || args[0] === "-v") {
-    console.log("sharkcode v0.3.3");
+    console.log("sharkcode v0.3.4");
     return;
   }
 
