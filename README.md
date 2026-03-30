@@ -1,49 +1,46 @@
 # Shark Code
 
-> Local First, open-source AI coding agent.
+> Local First, open-source AI coding agent.  
 > A small CLI inspired by Claude Code / OpenCode, with DeepSeek as the default provider.
 
 ## Install
-
-### Global install from npm
 
 ```bash
 npm install -g sharkcode
 ```
 
-Then run:
+Launch interactive mode:
+
+```bash
+sharkcode
+```
+
+Or single-shot mode:
 
 ```bash
 sharkcode "explain this codebase"
 sharkcode "fix the null pointer bug in auth.ts"
-sharkcode "add error handling to the API routes"
 ```
 
-### Run from source
+## Providers
 
-```bash
-git clone https://github.com/syy-shark/sharkcode.git
-cd sharkcode
-bun install
-bun run start "explain this codebase"
+Shark Code supports multiple providers. Switch between them anytime with `/provider`.
+
+| Provider | Description | Docs |
+|----------|-------------|------|
+| `deepseek` | DeepSeek 官网 (default) | [platform.deepseek.com](https://platform.deepseek.com) |
+| `ark` | 火山引擎 方舟 Coding Plan | [volcengine.com/activity/codingplan](https://www.volcengine.com/activity/codingplan) |
+
+## Configure
+
+### Option 1: Slash commands (recommended)
+
+Start `sharkcode`, then:
+
 ```
-
-## Configure API Key
-
-Shark Code reads `DEEPSEEK_API_KEY` from either an environment variable or `~/.sharkcode/config.toml`.
-
-### Option 1: Environment variable
-
-macOS / Linux:
-
-```bash
-export DEEPSEEK_API_KEY=sk-xxxxxx
-```
-
-Windows PowerShell:
-
-```powershell
-$env:DEEPSEEK_API_KEY="sk-xxxxxx"
+◆ /provider ark              # switch to 方舟 Coding Plan
+◆ /key sk-xxxxxxxxxx         # set API key (saved automatically)
+◆ /model deepseek-v3-250324  # optionally change model
 ```
 
 ### Option 2: Config file
@@ -51,37 +48,60 @@ $env:DEEPSEEK_API_KEY="sk-xxxxxx"
 `~/.sharkcode/config.toml`
 
 ```toml
-[api]
+[default]
+provider = "deepseek"   # or "ark"
+
+[providers.deepseek]
+# API key from https://platform.deepseek.com
 key = "sk-xxxxxx"
 model = "deepseek-chat"
-base_url = "https://api.deepseek.com/v1"
+
+[providers.ark]
+# API key from https://ark.cn-beijing.volces.com (方舟 Coding Plan)
+key = "sk-xxxxxx"
+model = "deepseek-v3-250324"
+```
+
+### Option 3: Environment variables
+
+```powershell
+$env:DEEPSEEK_API_KEY="sk-xxxxxx"   # deepseek provider
+$env:ARK_API_KEY="sk-xxxxxx"         # ark provider
+```
+
+## Slash Commands
+
+Type `/` commands anytime inside the interactive REPL:
+
+| Command | Description |
+|---------|-------------|
+| `/provider` | show current provider & key status |
+| `/provider <name>` | switch provider (`deepseek` \| `ark`) |
+| `/key <api-key>` | set API key for current provider |
+| `/model <model-id>` | set model for current provider |
+| `/clear` | clear conversation history |
+| `/help` | show command list |
+| `/exit` | quit |
+
+## Run from source
+
+```bash
+git clone https://github.com/syy-shark/sharkcode.git
+cd sharkcode
+bun install
+bun run start
 ```
 
 ## Upgrade
-
-When you publish a new version to npm, users can upgrade with:
 
 ```bash
 npm update -g sharkcode
 ```
 
-## Publish
-
-```bash
-npm login
-npm publish
-```
-
-Every code update is published as a new npm version. Typical flow:
-
-1. Update code.
-2. Bump `version` in `package.json`.
-3. Run `npm publish`.
-
 ## How It Works
 
-```text
-User input -> Prompt + Tools -> LLM -> Tool execution -> Result -> Repeat
+```
+User input → Prompt + Tools → LLM → Tool execution → Result → Repeat
 ```
 
 Built-in tools:
@@ -97,7 +117,7 @@ Built-in tools:
 
 - Bun + TypeScript
 - Vercel AI SDK
-- DeepSeek API
+- DeepSeek API / 火山引擎 方舟 API
 
 ## License
 
