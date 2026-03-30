@@ -1,4 +1,5 @@
 import chalk from "chalk";
+import { stopToolSpinner } from "./spinnerState.ts";
 
 const PURPLE = chalk.hex("#a855f7");
 const GRAY   = chalk.gray;
@@ -29,6 +30,8 @@ export async function askPermission(command: string): Promise<boolean> {
   }
 
   // ── Draw the permission box ───────────────────────────────────────────────
+  // Stop any active tool spinner first so it doesn't corrupt the box
+  stopToolSpinner();
   const width = Math.min(72, process.stdout.columns ?? 80);
   const innerWidth = width - 4; // 2 border chars + 2 padding
 

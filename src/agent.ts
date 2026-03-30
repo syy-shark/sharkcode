@@ -3,16 +3,42 @@ import chalk from "chalk";
 import { tools } from "./tools/index.ts";
 import { createProvider } from "./provider.ts";
 import type { Config } from "./config.ts";
+import { registerToolSpinner, unregisterToolSpinner } from "./spinnerState.ts";
 
 const PURPLE = chalk.hex("#a855f7");
+const PURPLE_DIM = chalk.hex("#7c3aed");
 
 // ─── Tool display labels ──────────────────────────────────────────────────────
 const TOOL_LABELS: Record<string, { icon: string; verb: string }> = {
-  read_file:  { icon: "📖", verb: "reading file" },
-  write_file: { icon: "✍️ ", verb: "writing file" },
-  edit_file:  { icon: "✏️ ", verb: "editing file" },
-  bash:       { icon: "⚙️ ", verb: "running command" },
+  read_file:  { icon: "📖", verb: "reading" },
+  write_file: { icon: "✍️ ", verb: "writing" },
+  edit_file:  { icon: "✏️ ", verb: "editing" },
+  bash:       { icon: "⚙️ ", verb: "running" },
 };
+
+// ─── Purple scan-line animation ───────────────────────────────────────────────
+function playScanLine(): Promise<void> {
+  return new Promise((resolve) => {
+    const cols = Math.min(process.stdout.columns ?? 80, 72);
+    const steps = 12;
+    const chars = "▏▎▍▌▋▊▉█▉▊▋▌▍▎▏";
+    let frame = 0;
+    const t = setInterval(() => {
+      const pos = Math.floor((frame / steps) * cols);
+      const bar =
+        PURPLE_DIM("─".repeat(pos)) +
+        PURPLE(chars[frame % chars.length]!) +
+        chalk.dim("─".repeat(Math.max(0, cols - pos - 1)));
+      process.stdout.write(`\r${bar}`);
+      frame++;
+      if (frame >= steps) {
+        clearInterval(t);
+        process.stdout.write(`\r${PURPLE("─".repeat(cols))}\n`);
+        resolve();
+      }
+    }, 30);
+  });
+}
 
 // ─── Spinner factory ──────────────────────────────────────────────────────────
 function createSpinner(label: string) {
@@ -22,21 +48,17 @@ function createSpinner(label: string) {
 
   return {
     start() {
-      process.stdout.write("\n");
       timer = setInterval(() => {
         process.stdout.write(
-          `\r${PURPLE(frames[i++ % frames.length]!)} ${chalk.gray(label)}`
+          `\r  ${PURPLE(frames[i++ % frames.length]!)} ${chalk.gray(label)}`
         );
       }, 80);
-    },
-    update(newLabel: string) {
-      label = newLabel;
     },
     stop() {
       if (timer) {
         clearInterval(timer);
         timer = null;
-        process.stdout.write("\r\x1b[K"); // clear the spinner line
+        process.stdout.write("\r\x1b[K"); // clear spinner line
       }
     },
   };
@@ -80,17 +102,16 @@ export async function runAgent(
   let currentStep = 0;
   const thinkingSpinner = createSpinner("thinking...");
   let thinkingDone = false;
+  let lastWasNewline = true; // track whether we need to prefix a newline
 
   // Tool-level spinner (one active at a time)
   let toolSpinner: ReturnType<typeof createSpinner> | null = null;
-  // Track the current tool name for the result line
   let currentToolName = "";
-  let currentToolArgs: unknown = null;
 
   thinkingSpinner.start();
 
   for await (const event of result.fullStream) {
-    // Stop thinking spinner on the first real output
+    // Stop thinking spinner on first real output
     if (!thinkingDone && (event.type === "text-delta" || event.type === "tool-call" || event.type === "error")) {
       thinkingSpinner.stop();
       thinkingDone = true;
@@ -99,26 +120,32 @@ export async function runAgent(
     switch (event.type) {
       case "text-delta":
         process.stdout.write(event.text);
+        lastWasNewline = event.text.endsWith("\n");
         break;
 
       case "tool-call": {
         const meta = TOOL_LABELS[event.toolName] ?? { icon: "🔧", verb: "running" };
         currentToolName = event.toolName;
-        currentToolArgs = event.input;
 
-        // Show what file / command we're acting on
         const argHint = getArgHint(event.toolName, event.input);
-        const spinLabel = `${meta.verb}${argHint ? ` › ${argHint}` : ""}`;
 
+        // Ensure we're on a fresh line
+        if (!lastWasNewline) process.stdout.write("\n");
+
+        // Purple scan-line flash
+        await playScanLine();
+
+        // Compact tool header: icon + verb + path on ONE line
         process.stdout.write(
-          "\n" +
-          chalk.cyan(`${meta.icon}  ${event.toolName}`) +
-          chalk.gray(argHint ? `  ${argHint}` : "") +
-          "\n"
+          `  ${meta.icon} ${PURPLE(meta.verb)}${argHint ? chalk.dim(" › ") + chalk.white(argHint) : ""}\n`
         );
 
-        toolSpinner = createSpinner(spinLabel);
+        // Spinner starts immediately on next line
+        toolSpinner = createSpinner(`${meta.verb}...`);
+        registerToolSpinner(() => toolSpinner?.stop());
         toolSpinner.start();
+
+        lastWasNewline = false;
         break;
       }
 
@@ -126,14 +153,14 @@ export async function runAgent(
         if (toolSpinner) {
           toolSpinner.stop();
           toolSpinner = null;
+          unregisterToolSpinner();
         }
-        const meta = TOOL_LABELS[currentToolName] ?? { icon: "🔧", verb: "done" };
-        const summary = truncate(String(event.output), 100);
+        const summary = truncate(String(event.output), 80);
+        // Single compact result line
         process.stdout.write(
-          chalk.green(`  ✓ done`) +
-          chalk.gray(`  ${summary}`) +
-          "\n\n"
+          `  ${chalk.green("✓")} ${chalk.dim(summary)}\n`
         );
+        lastWasNewline = true;
         break;
       }
 
@@ -141,10 +168,12 @@ export async function runAgent(
         if (toolSpinner) {
           toolSpinner.stop();
           toolSpinner = null;
+          unregisterToolSpinner();
         }
         process.stderr.write(
-          chalk.red(`\n  ✗ Tool error [${event.toolName}]: ${String(event.error)}\n`)
+          chalk.red(`  ✗ [${event.toolName}] ${String(event.error)}\n`)
         );
+        lastWasNewline = true;
         break;
 
       case "finish-step":
@@ -152,25 +181,24 @@ export async function runAgent(
         break;
 
       case "error":
-        if (toolSpinner) { toolSpinner.stop(); toolSpinner = null; }
+        if (toolSpinner) { toolSpinner.stop(); toolSpinner = null; unregisterToolSpinner(); }
         thinkingSpinner.stop();
-        process.stderr.write(chalk.red(`\n❌ Error: ${String(event.error)}\n`));
+        process.stderr.write(chalk.red(`\n❌ ${String(event.error)}\n`));
+        lastWasNewline = true;
         break;
     }
   }
 
   // Ensure spinners are always stopped
   thinkingSpinner.stop();
-  if (toolSpinner) toolSpinner.stop();
+  if (toolSpinner) { toolSpinner.stop(); unregisterToolSpinner(); }
 
-  process.stdout.write("\n");
+  if (!lastWasNewline) process.stdout.write("\n");
 
   const usage = await result.totalUsage;
   if (usage) {
     process.stderr.write(
-      chalk.gray(
-        `📊 ${usage.inputTokens} in / ${usage.outputTokens} out | steps: ${currentStep}\n`
-      )
+      chalk.dim(`  📊 ${usage.inputTokens}↑ ${usage.outputTokens}↓  steps:${currentStep}\n`)
     );
   }
 
@@ -185,9 +213,6 @@ export async function runAgent(
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/**
- * Extract a short human-readable arg hint (e.g. the file path or command).
- */
 function getArgHint(toolName: string, args: unknown): string {
   if (typeof args !== "object" || args === null) return "";
   const obj = args as Record<string, unknown>;
@@ -200,22 +225,10 @@ function getArgHint(toolName: string, args: unknown): string {
     case "bash":
       return truncate(String(obj.command ?? ""), 50);
     default: {
-      // First string value
       const first = Object.values(obj).find((v) => typeof v === "string");
       return first ? truncate(first as string, 50) : "";
     }
   }
-}
-
-function formatArgs(args: unknown): string {
-  if (typeof args !== "object" || args === null) return String(args);
-  const obj = args as Record<string, unknown>;
-  return Object.entries(obj)
-    .map(([k, v]) => {
-      const val = typeof v === "string" ? truncate(v, 60) : String(v);
-      return `${k}: ${val}`;
-    })
-    .join(", ");
 }
 
 function truncate(str: string, max: number): string {
