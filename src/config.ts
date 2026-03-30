@@ -15,6 +15,7 @@ export interface Config {
 export interface ProviderEntry {
   key: string;
   model: string;
+  baseURL?: string;
 }
 
 export type PermissionMode = "prompt" | "full-access";
@@ -27,17 +28,67 @@ export interface MultiConfig {
 
 // ─── Provider registry ────────────────────────────────────────────────────────
 
-export const PROVIDERS: Record<string, { baseURL: string; defaultModel: string; label: string }> = {
+export const PROVIDERS: Record<
+  string,
+  { baseURL: string; defaultModel: string; label: string; envKey?: string }
+> = {
   deepseek: {
     baseURL: "https://api.deepseek.com/v1",
     defaultModel: "deepseek-chat",
-    label: "DeepSeek 官网",
+    label: "DeepSeek",
+    envKey: "DEEPSEEK_API_KEY",
   },
   ark: {
-    // Coding Plan uses a dedicated endpoint — do NOT use /api/v3 (that's the pay-per-use endpoint)
     baseURL: "https://ark.cn-beijing.volces.com/api/coding/v3",
     defaultModel: "ark-code-latest",
     label: "方舟 Coding Plan",
+    envKey: "ARK_API_KEY",
+  },
+  openai: {
+    baseURL: "https://api.openai.com/v1",
+    defaultModel: "gpt-4o",
+    label: "OpenAI",
+    envKey: "OPENAI_API_KEY",
+  },
+  openrouter: {
+    baseURL: "https://openrouter.ai/api/v1",
+    defaultModel: "anthropic/claude-sonnet-4",
+    label: "OpenRouter",
+    envKey: "OPENROUTER_API_KEY",
+  },
+  siliconflow: {
+    baseURL: "https://api.siliconflow.cn/v1",
+    defaultModel: "deepseek-ai/DeepSeek-V3",
+    label: "SiliconFlow 硅基流动",
+    envKey: "SILICONFLOW_API_KEY",
+  },
+  groq: {
+    baseURL: "https://api.groq.com/openai/v1",
+    defaultModel: "llama-3.3-70b-versatile",
+    label: "Groq",
+    envKey: "GROQ_API_KEY",
+  },
+  together: {
+    baseURL: "https://api.together.xyz/v1",
+    defaultModel: "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+    label: "Together AI",
+    envKey: "TOGETHER_API_KEY",
+  },
+  qwen: {
+    baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    defaultModel: "qwen-plus",
+    label: "Qwen 通义千问",
+    envKey: "DASHSCOPE_API_KEY",
+  },
+  ollama: {
+    baseURL: "http://localhost:11434/v1",
+    defaultModel: "qwen2.5-coder:7b",
+    label: "Ollama 本地",
+  },
+  custom: {
+    baseURL: "",
+    defaultModel: "",
+    label: "Custom 自定义",
   },
 };
 
@@ -49,9 +100,7 @@ const CONFIG_FILE = join(CONFIG_DIR, "config.toml");
 // ─── Serialization ────────────────────────────────────────────────────────────
 
 function serializeConfig(mc: MultiConfig): string {
-  const dp = mc.providers.deepseek;
-  const ap = mc.providers.ark;
-  return [
+  const lines = [
     "# Shark Code Configuration",
     "# https://github.com/syy-shark/sharkcode",
     "",
@@ -59,17 +108,21 @@ function serializeConfig(mc: MultiConfig): string {
     `provider = "${mc.activeProvider}"`,
     `permission_mode = "${mc.permissionMode}"`,
     "",
-    "[providers.deepseek]",
-    "# API key from https://platform.deepseek.com",
-    `key = "${dp?.key ?? ""}"`,
-    `model = "${dp?.model ?? PROVIDERS.deepseek!.defaultModel}"`,
-    "",
-    "[providers.ark]",
-    "# API key from https://ark.cn-beijing.volces.com (方舟 Coding Plan)",
-    `key = "${ap?.key ?? ""}"`,
-    `model = "${ap?.model ?? PROVIDERS.ark!.defaultModel}"`,
-    "",
-  ].join("\n");
+  ];
+
+  for (const [id, meta] of Object.entries(PROVIDERS)) {
+    const entry = mc.providers[id];
+    lines.push(`[providers.${id}]`);
+    if (meta.envKey) lines.push(`# ENV: ${meta.envKey}`);
+    lines.push(`key = "${entry?.key ?? ""}"`);
+    lines.push(`model = "${entry?.model ?? meta.defaultModel}"`);
+    if (id === "custom" || id === "ollama") {
+      lines.push(`base_url = "${entry?.baseURL ?? meta.baseURL}"`);
+    }
+    lines.push("");
+  }
+
+  return lines.join("\n");
 }
 
 // ─── Ensure config dir/file exist ─────────────────────────────────────────────
@@ -79,13 +132,14 @@ function ensureConfig(): void {
     mkdirSync(CONFIG_DIR, { recursive: true });
   }
   if (!existsSync(CONFIG_FILE)) {
+    const providers: Record<string, ProviderEntry> = {};
+    for (const [id, meta] of Object.entries(PROVIDERS)) {
+      providers[id] = { key: "", model: meta.defaultModel };
+    }
     const initial: MultiConfig = {
       activeProvider: "deepseek",
       permissionMode: "prompt",
-      providers: {
-        deepseek: { key: "", model: PROVIDERS.deepseek!.defaultModel },
-        ark: { key: "", model: PROVIDERS.ark!.defaultModel },
-      },
+      providers,
     };
     writeFileSync(CONFIG_FILE, serializeConfig(initial), "utf-8");
   }
@@ -110,16 +164,25 @@ export function readMultiConfig(): MultiConfig {
   const providersRaw = (toml.providers ?? {}) as Record<string, Record<string, string>>;
   const defaultSection = (toml.default ?? {}) as Record<string, string>;
 
-  const deepseekKey =
-    process.env.DEEPSEEK_API_KEY ||
-    providersRaw.deepseek?.key ||
-    legacy?.key ||
-    "";
+  const providers: Record<string, ProviderEntry> = {};
 
-  const arkKey =
-    process.env.ARK_API_KEY ||
-    providersRaw.ark?.key ||
-    "";
+  for (const [id, meta] of Object.entries(PROVIDERS)) {
+    const raw = providersRaw[id];
+    const envKey = meta.envKey ? process.env[meta.envKey] : undefined;
+
+    let key = envKey || raw?.key || "";
+
+    // Legacy migration for deepseek
+    if (id === "deepseek" && !key && legacy?.key) {
+      key = legacy.key;
+    }
+
+    providers[id] = {
+      key,
+      model: raw?.model || (id === "deepseek" && legacy?.model ? legacy.model : "") || meta.defaultModel,
+      baseURL: raw?.base_url || undefined,
+    };
+  }
 
   // If we migrated from legacy format, the active provider is deepseek
   const activeProvider = defaultSection.provider || (legacy ? "deepseek" : "deepseek");
@@ -129,16 +192,7 @@ export function readMultiConfig(): MultiConfig {
   return {
     activeProvider,
     permissionMode,
-    providers: {
-      deepseek: {
-        key: deepseekKey,
-        model: providersRaw.deepseek?.model || legacy?.model || PROVIDERS.deepseek!.defaultModel,
-      },
-      ark: {
-        key: arkKey,
-        model: providersRaw.ark?.model || PROVIDERS.ark!.defaultModel,
-      },
-    },
+    providers,
   };
 }
 
@@ -160,7 +214,7 @@ export function resolveConfig(mc: MultiConfig): Config {
     providerName: name,
     apiKey: entry?.key || "",
     model: entry?.model || meta?.defaultModel || "deepseek-chat",
-    baseURL: meta?.baseURL || PROVIDERS.deepseek!.baseURL,
+    baseURL: entry?.baseURL || meta?.baseURL || PROVIDERS.deepseek!.baseURL,
   };
 }
 

@@ -1,5 +1,8 @@
 import { stepCountIs, streamText, type ModelMessage } from "ai";
 import chalk from "chalk";
+import { existsSync, readFileSync } from "fs";
+import { join } from "path";
+import { execSync } from "child_process";
 import { tools } from "./tools/index.ts";
 import { createProvider } from "./provider.ts";
 import type { Config } from "./config.ts";
@@ -10,10 +13,15 @@ const PURPLE_DIM = chalk.hex("#7c3aed");
 
 // ─── Tool display labels ──────────────────────────────────────────────────────
 const TOOL_LABELS: Record<string, { icon: string; verb: string }> = {
-  read_file:  { icon: "📖", verb: "reading" },
-  write_file: { icon: "✍️ ", verb: "writing" },
-  edit_file:  { icon: "✏️ ", verb: "editing" },
-  bash:       { icon: "⚙️ ", verb: "running" },
+  read_file:       { icon: "📖", verb: "reading" },
+  write_file:      { icon: "✍️ ", verb: "writing" },
+  edit_file:       { icon: "✏️ ", verb: "editing" },
+  bash:            { icon: "⚙️ ", verb: "running" },
+  glob:            { icon: "🔍", verb: "finding files" },
+  grep:            { icon: "🔎", verb: "searching" },
+  list_directory:  { icon: "📂", verb: "listing" },
+  web_fetch:       { icon: "🌐", verb: "fetching" },
+  think:           { icon: "💭", verb: "thinking" },
 };
 
 // ─── Purple scan-line animation ───────────────────────────────────────────────
@@ -64,25 +72,140 @@ function createSpinner(label: string) {
   };
 }
 
+// ─── Project context detection ────────────────────────────────────────────────
+function detectProject(): string {
+  const cwd = process.cwd();
+  const parts: string[] = [];
+
+  if (existsSync(join(cwd, "package.json"))) {
+    try {
+      const pkg = JSON.parse(readFileSync(join(cwd, "package.json"), "utf-8"));
+      const deps = [
+        ...Object.keys(pkg.dependencies ?? {}),
+        ...Object.keys(pkg.devDependencies ?? {}),
+      ];
+      parts.push(`Node.js project: ${pkg.name ?? "unknown"} v${pkg.version ?? "0.0.0"}`);
+      if (deps.length > 0) parts.push(`  Key deps: ${deps.slice(0, 15).join(", ")}`);
+      if (pkg.scripts) parts.push(`  Scripts: ${Object.keys(pkg.scripts).join(", ")}`);
+    } catch { /* ignore */ }
+  }
+  if (existsSync(join(cwd, "Cargo.toml"))) parts.push("Rust project (Cargo.toml detected)");
+  if (existsSync(join(cwd, "go.mod"))) parts.push("Go project (go.mod detected)");
+  if (existsSync(join(cwd, "pyproject.toml"))) parts.push("Python project (pyproject.toml)");
+  if (existsSync(join(cwd, "setup.py"))) parts.push("Python project (setup.py)");
+  if (existsSync(join(cwd, "pom.xml"))) parts.push("Java/Maven project");
+  if (existsSync(join(cwd, "build.gradle")) || existsSync(join(cwd, "build.gradle.kts"))) parts.push("Java/Gradle project");
+  if (existsSync(join(cwd, "Makefile"))) parts.push("Makefile present");
+  if (existsSync(join(cwd, "docker-compose.yml")) || existsSync(join(cwd, "Dockerfile"))) parts.push("Docker project");
+  if (existsSync(join(cwd, "tsconfig.json"))) parts.push("TypeScript configured");
+
+  return parts.join("\n");
+}
+
+function readProjectInstructions(): string | null {
+  const candidates = [
+    join(process.cwd(), ".sharkcode.md"),
+    join(process.cwd(), ".sharkcode", "instructions.md"),
+    join(process.cwd(), "SHARKCODE.md"),
+  ];
+
+  for (const p of candidates) {
+    if (existsSync(p)) {
+      try {
+        return readFileSync(p, "utf-8").slice(0, 8000);
+      } catch { /* ignore */ }
+    }
+  }
+  return null;
+}
+
+function getGitContext(): string | null {
+  try {
+    const branch = execSync("git branch --show-current", {
+      encoding: "utf-8", timeout: 3000, cwd: process.cwd(),
+    }).trim();
+    const status = execSync("git status --porcelain", {
+      encoding: "utf-8", timeout: 3000, cwd: process.cwd(),
+    }).trim();
+
+    let ctx = `Git branch: ${branch}`;
+    if (status) {
+      const lines = status.split("\n");
+      ctx += `\nChanged files (${lines.length}):`;
+      ctx += "\n" + lines.slice(0, 15).join("\n");
+      if (lines.length > 15) ctx += `\n  ... and ${lines.length - 15} more`;
+    } else {
+      ctx += "\nWorking tree clean";
+    }
+    return ctx;
+  } catch {
+    return null;
+  }
+}
+
 function buildSystemPrompt(): string {
-  return `You are Shark Code, an AI coding assistant. You help users with coding tasks by reading, writing, and editing files, and running shell commands.
+  const os = process.platform === "win32" ? "Windows" : process.platform === "darwin" ? "macOS" : "Linux";
+  const shell = process.platform === "win32" ? "PowerShell" : "bash";
 
-Current working directory: ${process.cwd()}
-Environment: Windows with PowerShell. Use PowerShell-compatible commands, not bash syntax.
+  const parts: string[] = [];
 
+  parts.push(
+    `You are Shark Code 🦈, a powerful AI coding agent running locally on the user's machine. ` +
+    `You help users understand, write, debug, and refactor code by reading/writing files, ` +
+    `searching codebases, and running shell commands.`
+  );
+
+  // Environment
+  parts.push(`
+Environment:
+- OS: ${os}
+- Shell: ${shell}
+- Working directory: ${process.cwd()}`);
+
+  // Project context
+  const projectCtx = detectProject();
+  if (projectCtx) parts.push(`\nProject:\n${projectCtx}`);
+
+  // Git context
+  const gitCtx = getGitContext();
+  if (gitCtx) parts.push(`\n${gitCtx}`);
+
+  // Project instructions
+  const instructions = readProjectInstructions();
+  if (instructions) {
+    parts.push(`\n<project_instructions>\n${instructions}\n</project_instructions>`);
+  }
+
+  // Tools
+  parts.push(`
 Available tools:
-- read_file: Read the contents of a file
-- write_file: Create or overwrite a file (creates parent dirs)
+- read_file: Read file contents (supports line ranges and line numbers)
+- write_file: Create or overwrite files (creates parent directories)
 - edit_file: Find and replace an exact string in a file
-- bash: Execute a shell command (requires user approval)
+- bash: Execute shell commands (may require user approval)
+- glob: Find files by glob pattern (e.g. '**/*.ts', 'src/**/*.{js,tsx}')
+- grep: Search for text/regex across files with line numbers
+- list_directory: List directory contents as a tree with file sizes
+- web_fetch: Fetch content from URLs (HTML auto-converted to text)
+- think: Plan your approach before complex multi-step tasks`);
 
+  // Guidelines
+  parts.push(`
 Guidelines:
-- Always read a file before editing it
-- Explain what you plan to do before making changes
-- Use edit_file for targeted changes, write_file for creating new files
-- When using shell commands, prefer PowerShell built-ins or commands that work on Windows
-- Keep changes minimal and focused on the user's request
-- When done, summarize what you changed`;
+1. EXPLORE FIRST: Use glob, grep, and list_directory to understand the codebase before making changes
+2. ALWAYS read a file before editing it — never edit blind
+3. Use think tool to plan multi-step changes before starting
+4. Use edit_file for surgical changes, write_file for new files
+5. After making changes, verify them (re-read the file, run tests if applicable)
+6. When using bash, prefer ${shell}-compatible commands
+7. Keep changes minimal and focused on the user's request
+8. Summarize what you changed when done
+9. If a task is unclear, ask for clarification
+10. Consider edge cases and error handling
+11. Respect existing code style and conventions
+12. For large refactors, make changes incrementally and verify each step`);
+
+  return parts.join("\n");
 }
 
 export async function runAgent(
@@ -96,7 +219,8 @@ export async function runAgent(
     system: buildSystemPrompt(),
     messages,
     tools,
-    stopWhen: stepCountIs(30),
+    maxRetries: 2,
+    stopWhen: stepCountIs(50),
   });
 
   let currentStep = 0;

@@ -126,7 +126,7 @@ async function togglePermissionMode(multiConfig: MultiConfig): Promise<SlashResu
   return { multiConfig: updated, config: resolveConfig(updated) };
 }
 
-// ─── Setup flow: provider picker → API key input ──────────────────────────────
+// ─── Setup flow: provider picker → API key input → model selection ─────────────
 async function showSetupFlow(multiConfig: MultiConfig): Promise<SlashResult> {
   console.log();
   try {
@@ -134,7 +134,9 @@ async function showSetupFlow(multiConfig: MultiConfig): Promise<SlashResult> {
     const providerChoices = Object.entries(PROVIDERS).map(([id, meta]) => {
       const hasKey = !!multiConfig.providers[id]?.key;
       const badge  = hasKey ? GREEN("✓ 已配置") : YELLOW("✗ 未配置");
-      return { name: `${meta.label}   ${badge}`, value: id };
+      // No key required for ollama
+      const finalBadge = id === "ollama" ? GREEN("✓ 本地") : badge;
+      return { name: `${meta.label}   ${finalBadge}`, value: id };
     });
 
     const selectedProvider = await select({
@@ -143,41 +145,72 @@ async function showSetupFlow(multiConfig: MultiConfig): Promise<SlashResult> {
       default: multiConfig.activeProvider,
     });
 
-    // Step 2 — API key
+    // Step 2 — API key (skip for ollama)
     const currentKey = multiConfig.providers[selectedProvider]?.key ?? "";
-    const hint = currentKey
-      ? GRAY("(回车保留  " + currentKey.slice(0, 6) + "•••)")
-      : GRAY("(必填)");
+    let newKey = currentKey;
 
-    const rawKey = await input({
-      message: PURPLE("◆ API Key ") + hint,
-      default: currentKey || undefined,
+    if (selectedProvider !== "ollama") {
+      const hint = currentKey
+        ? GRAY("(回车保留  " + currentKey.slice(0, 6) + "•••)")
+        : GRAY("(必填)");
+
+      const rawKey = await input({
+        message: PURPLE("◆ API Key ") + hint,
+        default: currentKey || undefined,
+      });
+
+      newKey = rawKey.trim() || currentKey;
+    }
+
+    // Step 3 — model selection
+    const meta = PROVIDERS[selectedProvider];
+    const currentModel = multiConfig.providers[selectedProvider]?.model ?? meta?.defaultModel ?? "";
+    const modelHint = GRAY(`(回车保留 ${currentModel})`);
+
+    const rawModel = await input({
+      message: PURPLE("◆ 模型 ") + modelHint,
+      default: currentModel || undefined,
     });
 
-    const newKey = rawKey.trim() || currentKey;
+    const newModel = rawModel.trim() || currentModel;
+
+    // Step 4 — base URL for custom/ollama
+    let newBaseURL: string | undefined;
+    if (selectedProvider === "custom" || selectedProvider === "ollama") {
+      const currentURL = multiConfig.providers[selectedProvider]?.baseURL ?? meta?.baseURL ?? "";
+      const urlHint = currentURL
+        ? GRAY(`(回车保留 ${currentURL})`)
+        : GRAY("(必填，如 http://localhost:11434/v1)");
+
+      const rawURL = await input({
+        message: PURPLE("◆ Base URL ") + urlHint,
+        default: currentURL || undefined,
+      });
+
+      newBaseURL = rawURL.trim() || currentURL || undefined;
+    }
 
     // Build updated config
     let updated: MultiConfig = { ...multiConfig, activeProvider: selectedProvider };
-    if (newKey) {
-      updated = {
-        ...updated,
-        providers: {
-          ...updated.providers,
-          [selectedProvider]: {
-            model: PROVIDERS[selectedProvider]?.defaultModel ?? "",
-            ...(updated.providers[selectedProvider] ?? {}),
-            key: newKey,
-          },
+    updated = {
+      ...updated,
+      providers: {
+        ...updated.providers,
+        [selectedProvider]: {
+          ...(updated.providers[selectedProvider] ?? {}),
+          key: newKey,
+          model: newModel,
+          baseURL: newBaseURL,
         },
-      };
-    }
+      },
+    };
 
     saveMultiConfig(updated);
     const newConfig = resolveConfig(updated);
 
     const keyMsg = newKey && newKey !== currentKey ? "，API Key 已保存" : "";
-    console.log(GREEN(`\n  ✓ 已切换到 ${PROVIDERS[selectedProvider]!.label}${keyMsg}`) + "\n");
-    if (!newConfig.apiKey) {
+    console.log(GREEN(`\n  ✓ 已切换到 ${PROVIDERS[selectedProvider]!.label} [${newModel}]${keyMsg}`) + "\n");
+    if (!newConfig.apiKey && selectedProvider !== "ollama") {
       console.log(YELLOW("  ⚠ 还未填写 API Key，无法发送消息\n"));
     }
 
@@ -294,12 +327,16 @@ async function main() {
     console.log(PURPLE("  Usage:"));
     console.log("    " + PURPLE("sharkcode") + GRAY("          — 交互模式（直接启动）"));
     console.log("    " + PURPLE("sharkcode") + YELLOW(' "prompt"') + GRAY("  — 单次执行"));
-    console.log(GRAY("\n  交互模式内输入 / 调出指令菜单\n"));
+    console.log(GRAY("\n  交互模式内输入 / 调出指令菜单，/help 查看所有命令"));
+    console.log(GRAY("\n  支持 Provider：DeepSeek | OpenAI | OpenRouter | SiliconFlow | Groq"));
+    console.log(GRAY("                Together AI | Qwen | Ollama | 方舟 | 自定义"));
+    console.log(GRAY("\n  内置工具：read_file | write_file | edit_file | bash | glob"));
+    console.log(GRAY("           grep | list_directory | web_fetch | think\n"));
     return;
   }
 
   if (args[0] === "--version" || args[0] === "-v") {
-    console.log("sharkcode v0.3.6");
+    console.log("sharkcode v0.5.0");
     return;
   }
 
@@ -378,6 +415,33 @@ async function main() {
       // Restore raw mode after inquirer
       try { process.stdin.setRawMode(true); process.stdin.resume(); } catch {}
       console.log(statusLine(config));
+      continue;
+    }
+
+    // /help → show help
+    if (trimmed === "/help") {
+      console.log(`
+${PURPLE("  可用命令：")}
+  ${GRAY("/")}             ${GRAY("─ 打开指令菜单")}
+  ${GRAY("/provider")}     ${GRAY("─ 切换 / 配置 Provider")}
+  ${GRAY("/model")}        ${GRAY("─ 切换模型")}
+  ${GRAY("/help")}         ${GRAY("─ 显示此帮助")}
+  ${GRAY("exit / quit")}   ${GRAY("─ 退出")}
+
+${PURPLE("  可用工具 (Agent 自动调用)：")}
+  ${CYAN("read_file")}     ${GRAY("─ 读取文件（支持行号范围）")}
+  ${CYAN("write_file")}    ${GRAY("─ 创建/覆盖文件")}
+  ${CYAN("edit_file")}     ${GRAY("─ 精确查找替换")}
+  ${CYAN("bash")}          ${GRAY("─ 执行 Shell 命令")}
+  ${CYAN("glob")}          ${GRAY("─ 按模式查找文件")}
+  ${CYAN("grep")}          ${GRAY("─ 搜索文件内容")}
+  ${CYAN("list_directory")}${GRAY("─ 目录树")}
+  ${CYAN("web_fetch")}     ${GRAY("─ 抓取网页内容")}
+  ${CYAN("think")}         ${GRAY("─ 复杂问题推理")}
+
+${PURPLE("  项目配置：")}
+  ${GRAY("在项目根目录创建 .sharkcode.md 文件，写入项目说明，Agent 会自动读取")}
+`);
       continue;
     }
 
