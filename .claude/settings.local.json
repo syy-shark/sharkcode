@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "defaultMode": "bypassPermissions",
+    "allow": [
+      "Bash(bun test:*)",
+      "Bash(bun src/cli.ts --help)"
+    ]
+  }
+}

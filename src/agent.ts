@@ -1,4 +1,4 @@
-import { stepCountIs, streamText } from "ai";
+import { stepCountIs, streamText, type ModelMessage } from "ai";
 import chalk from "chalk";
 import { tools } from "./tools/index.ts";
 import { createProvider } from "./provider.ts";
@@ -25,13 +25,16 @@ Guidelines:
 - When done, summarize what you changed`;
 }
 
-export async function runAgent(prompt: string, config: Config) {
+export async function runAgent(
+  messages: ModelMessage[],
+  config: Config
+): Promise<ModelMessage[]> {
   const model = createProvider(config);
 
   const result = streamText({
     model,
     system: buildSystemPrompt(),
-    prompt,
+    messages,
     tools,
     stopWhen: stepCountIs(30),
   });
@@ -44,22 +47,24 @@ export async function runAgent(prompt: string, config: Config) {
         process.stdout.write(event.text);
         break;
 
-      case "tool-input-available":
+      case "tool-call":
         process.stdout.write(
           chalk.cyan(`\n🔧 ${event.toolName}`) +
             chalk.gray(`(${formatArgs(event.input)})\n`)
         );
         break;
 
-      case "tool-output-available":
+      case "tool-result":
         process.stdout.write(
-          chalk.green(`✅ tool`) +
+          chalk.green(`✅ done`) +
             chalk.gray(` → ${truncate(String(event.output), 120)}\n\n`)
         );
         break;
 
-      case "tool-output-error":
-        process.stderr.write(chalk.red(`\n❌ Tool error: ${event.errorText}\n`));
+      case "tool-error":
+        process.stderr.write(
+          chalk.red(`\n❌ Tool error [${event.toolName}]: ${String(event.error)}\n`)
+        );
         break;
 
       case "finish-step":
@@ -67,7 +72,7 @@ export async function runAgent(prompt: string, config: Config) {
         break;
 
       case "error":
-        process.stderr.write(chalk.red(`\n❌ Error: ${event.errorText}\n`));
+        process.stderr.write(chalk.red(`\n❌ Error: ${String(event.error)}\n`));
         break;
     }
   }
@@ -81,6 +86,14 @@ export async function runAgent(prompt: string, config: Config) {
         `\n📊 Tokens: ${usage.inputTokens} in / ${usage.outputTokens} out | Steps: ${currentStep}\n`
       )
     );
+  }
+
+  // Append response messages to conversation history for multi-turn support
+  try {
+    const { messages: responseMessages } = await result.response;
+    return [...messages, ...responseMessages] as ModelMessage[];
+  } catch {
+    return messages;
   }
 }
 
@@ -99,3 +112,5 @@ function truncate(str: string, max: number): string {
   const oneLine = str.replace(/\n/g, "\\n");
   return oneLine.length > max ? oneLine.slice(0, max) + "…" : oneLine;
 }
+
+
