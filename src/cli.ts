@@ -1,5 +1,6 @@
 import chalk from "chalk";
 import * as readline from "readline";
+import { select, input } from "@inquirer/prompts";
 import {
   readMultiConfig,
   saveMultiConfig,
@@ -11,15 +12,15 @@ import {
 import { runAgent } from "./agent.ts";
 import type { ModelMessage } from "ai";
 
-// ─── Purple pixel-art banner ──────────────────────────────────────────────────
+// ─── Colors ───────────────────────────────────────────────────────────────────
 const PURPLE = chalk.hex("#a855f7");
-const GRAY = chalk.gray;
+const GRAY   = chalk.gray;
 const YELLOW = chalk.yellow;
-const GREEN = chalk.green;
-const RED = chalk.red;
-const CYAN = chalk.cyan;
+const GREEN  = chalk.green;
+const RED    = chalk.red;
+const CYAN   = chalk.cyan;
 
-// 5×5 bitmap glyphs, each pixel rendered as "██" (2 chars wide)
+// ─── Purple pixel-art banner ──────────────────────────────────────────────────
 const GLYPHS: Record<string, number[][]> = {
   S: [[0,1,1,1,1],[1,0,0,0,0],[0,1,1,1,0],[0,0,0,0,1],[1,1,1,1,0]],
   H: [[1,0,0,0,1],[1,0,0,0,1],[1,1,1,1,1],[1,0,0,0,1],[1,0,0,0,1]],
@@ -51,28 +52,7 @@ function renderWord(word: string, padLeft = 2): string[] {
 
 const BANNER = ["", ...renderWord("shark", 2), "", ...renderWord("code", 8), ""].join("\n");
 
-// ─── Slash command help ───────────────────────────────────────────────────────
-
-function printSlashHelp(): void {
-  const pad = (s: string, n: number) => s + " ".repeat(Math.max(0, n - s.length));
-  console.log(PURPLE("\n  ◆ Slash Commands\n"));
-  const cmds: [string, string][] = [
-    ["/provider",              "show current provider & list options"],
-    ["/provider <name>",       "switch provider  (deepseek | ark)"],
-    ["/key <api-key>",         "set API key for current provider"],
-    ["/model <model-id>",      "set model for current provider"],
-    ["/clear",                 "clear conversation history"],
-    ["/help",                  "show this menu"],
-    ["/exit",                  "quit"],
-  ];
-  for (const [cmd, desc] of cmds) {
-    console.log("  " + PURPLE(pad(cmd, 26)) + GRAY(desc));
-  }
-  console.log();
-}
-
-// ─── Slash command handler ────────────────────────────────────────────────────
-
+// ─── Slash result type ────────────────────────────────────────────────────────
 interface SlashResult {
   multiConfig: MultiConfig;
   config: Config;
@@ -80,139 +60,94 @@ interface SlashResult {
   exit?: boolean;
 }
 
-function handleSlash(
-  input: string,
-  multiConfig: MultiConfig
-): SlashResult | null {
-  const parts = input.trim().split(/\s+/);
-  const cmd = parts[0]!.toLowerCase();
-  const arg = parts.slice(1).join(" ");
-
-  // ── /help or bare / ──────────────────────────────────────────────────────
-  if (cmd === "/" || cmd === "/help") {
-    printSlashHelp();
-    return { multiConfig, config: resolveConfig(multiConfig) };
+// ─── Interactive command menu (triggered by bare "/") ─────────────────────────
+async function showCommandMenu(multiConfig: MultiConfig): Promise<SlashResult> {
+  console.log();
+  try {
+    const action = await select({
+      message: PURPLE("◆ 选择操作"),
+      choices: [
+        { name: "🔌  切换 / 配置 Provider", value: "provider" },
+        { name: "🗑️  清空对话历史",          value: "clear"    },
+        { name: "🚪  退出",                  value: "exit"     },
+      ],
+    });
+    switch (action) {
+      case "provider": return showSetupFlow(multiConfig);
+      case "clear":
+        console.log(GRAY("\n  ✓ 对话已清空\n"));
+        return { multiConfig, config: resolveConfig(multiConfig), clearHistory: true };
+      case "exit":
+        console.log(GRAY("\nBye! 🦈"));
+        return { multiConfig, config: resolveConfig(multiConfig), exit: true };
+    }
+  } catch {
+    // Ctrl+C inside menu — cancel, resume REPL
+    console.log(GRAY("\n  取消\n"));
   }
+  return { multiConfig, config: resolveConfig(multiConfig) };
+}
 
-  // ── /exit ─────────────────────────────────────────────────────────────────
-  if (cmd === "/exit" || cmd === "/quit") {
-    console.log(GRAY("Bye! 🦈"));
-    return { multiConfig, config: resolveConfig(multiConfig), exit: true };
-  }
+// ─── Setup flow: provider picker → API key input ──────────────────────────────
+async function showSetupFlow(multiConfig: MultiConfig): Promise<SlashResult> {
+  console.log();
+  try {
+    // Step 1 — choose provider
+    const providerChoices = Object.entries(PROVIDERS).map(([id, meta]) => {
+      const hasKey = !!multiConfig.providers[id]?.key;
+      const badge  = hasKey ? GREEN("✓ 已配置") : YELLOW("✗ 未配置");
+      return { name: `${meta.label}   ${badge}`, value: id };
+    });
 
-  // ── /clear ────────────────────────────────────────────────────────────────
-  if (cmd === "/clear") {
-    console.log(GRAY("  ✓ Conversation cleared."));
-    return { multiConfig, config: resolveConfig(multiConfig), clearHistory: true };
-  }
+    const selectedProvider = await select({
+      message: PURPLE("◆ 选择 Provider"),
+      choices: providerChoices,
+      default: multiConfig.activeProvider,
+    });
 
-  // ── /provider ─────────────────────────────────────────────────────────────
-  if (cmd === "/provider") {
-    if (!arg) {
-      // Show status
-      const current = multiConfig.activeProvider;
-      console.log(PURPLE("\n  ◆ Providers\n"));
-      for (const [name, meta] of Object.entries(PROVIDERS)) {
-        const entry = multiConfig.providers[name];
-        const active = name === current;
-        const hasKey = !!entry?.key;
-        const marker = active ? PURPLE("▶") : " ";
-        const keyStatus = hasKey ? GREEN("✓ key set") : YELLOW("✗ no key");
-        console.log(
-          `  ${marker} ${active ? PURPLE(name) : GRAY(name)}` +
-          `  ${GRAY(meta.label)}` +
-          `  ${keyStatus}` +
-          (active ? `  ${GRAY("model: " + (entry?.model ?? meta.defaultModel))}` : "")
-        );
-      }
-      console.log(
-        `\n  ${GRAY("Usage:")} ${PURPLE("/provider deepseek")} ${GRAY("or")} ${PURPLE("/provider ark")}\n`
-      );
-      return { multiConfig, config: resolveConfig(multiConfig) };
+    // Step 2 — API key
+    const currentKey = multiConfig.providers[selectedProvider]?.key ?? "";
+    const hint = currentKey
+      ? GRAY("(回车保留  " + currentKey.slice(0, 6) + "•••)")
+      : GRAY("(必填)");
+
+    const rawKey = await input({
+      message: PURPLE("◆ API Key ") + hint,
+      default: currentKey || undefined,
+    });
+
+    const newKey = rawKey.trim() || currentKey;
+
+    // Build updated config
+    let updated: MultiConfig = { ...multiConfig, activeProvider: selectedProvider };
+    if (newKey) {
+      updated = {
+        ...updated,
+        providers: {
+          ...updated.providers,
+          [selectedProvider]: {
+            model: PROVIDERS[selectedProvider]?.defaultModel ?? "",
+            ...(updated.providers[selectedProvider] ?? {}),
+            key: newKey,
+          },
+        },
+      };
     }
 
-    const name = arg.toLowerCase();
-    if (!PROVIDERS[name]) {
-      console.log(RED(`  ✗ Unknown provider: "${name}". Available: ${Object.keys(PROVIDERS).join(", ")}`));
-      return { multiConfig, config: resolveConfig(multiConfig) };
-    }
-
-    const updated: MultiConfig = { ...multiConfig, activeProvider: name };
     saveMultiConfig(updated);
     const newConfig = resolveConfig(updated);
 
-    console.log(
-      GREEN(`\n  ✓ Switched to ${PROVIDERS[name]!.label}`) +
-      GRAY(` (${name}) — model: ${newConfig.model}`)
-    );
-
+    const keyMsg = newKey && newKey !== currentKey ? "，API Key 已保存" : "";
+    console.log(GREEN(`\n  ✓ 已切换到 ${PROVIDERS[selectedProvider]!.label}${keyMsg}`) + "\n");
     if (!newConfig.apiKey) {
-      console.log(YELLOW(`  ⚠ No API key set. Use /key <your-key> to configure it.\n`));
-    } else {
-      console.log();
+      console.log(YELLOW("  ⚠ 还未填写 API Key，无法发送消息\n"));
     }
 
     return { multiConfig: updated, config: newConfig };
+  } catch {
+    console.log(GRAY("\n  取消\n"));
+    return { multiConfig, config: resolveConfig(multiConfig) };
   }
-
-  // ── /key ──────────────────────────────────────────────────────────────────
-  if (cmd === "/key") {
-    if (!arg) {
-      console.log(YELLOW(`  Usage: /key <your-api-key>`));
-      return { multiConfig, config: resolveConfig(multiConfig) };
-    }
-
-    const name = multiConfig.activeProvider;
-    const updated: MultiConfig = {
-      ...multiConfig,
-      providers: {
-        ...multiConfig.providers,
-        [name]: {
-          ...(multiConfig.providers[name] ?? { model: PROVIDERS[name]?.defaultModel ?? "" }),
-          key: arg,
-        },
-      },
-    };
-    saveMultiConfig(updated);
-
-    // Mask the key for display
-    const masked = arg.slice(0, 6) + "•".repeat(Math.max(0, arg.length - 10)) + arg.slice(-4);
-    console.log(GREEN(`  ✓ API key saved for ${name}: ${GRAY(masked)}\n`));
-
-    return { multiConfig: updated, config: resolveConfig(updated) };
-  }
-
-  // ── /model ────────────────────────────────────────────────────────────────
-  if (cmd === "/model") {
-    if (!arg) {
-      const name = multiConfig.activeProvider;
-      const current = multiConfig.providers[name]?.model ?? PROVIDERS[name]?.defaultModel;
-      console.log(GRAY(`  Current model: `) + PURPLE(current ?? "unknown"));
-      console.log(GRAY(`  Usage: /model <model-id>\n`));
-      return { multiConfig, config: resolveConfig(multiConfig) };
-    }
-
-    const name = multiConfig.activeProvider;
-    const updated: MultiConfig = {
-      ...multiConfig,
-      providers: {
-        ...multiConfig.providers,
-        [name]: {
-          ...(multiConfig.providers[name] ?? { key: "" }),
-          model: arg,
-        },
-      },
-    };
-    saveMultiConfig(updated);
-    console.log(GREEN(`  ✓ Model set to ${PURPLE(arg)} for ${name}\n`));
-
-    return { multiConfig: updated, config: resolveConfig(updated) };
-  }
-
-  // ── Unknown command ───────────────────────────────────────────────────────
-  console.log(RED(`  ✗ Unknown command: "${cmd}"`));
-  console.log(GRAY(`  Type /help to see available commands.\n`));
-  return { multiConfig, config: resolveConfig(multiConfig) };
 }
 
 // ─── Read one line from stdin ─────────────────────────────────────────────────
@@ -225,20 +160,18 @@ async function readLine(prompt: string): Promise<string | null> {
       rl.close();
       resolve(answer);
     });
-    rl.on("close", () => {
-      if (!answered) resolve(null);
-    });
+    rl.on("close", () => { if (!answered) resolve(null); });
   });
 }
 
 // ─── Status line ─────────────────────────────────────────────────────────────
 function statusLine(config: Config): string {
-  const providerLabel = PROVIDERS[config.providerName]?.label ?? config.providerName;
+  const label = PROVIDERS[config.providerName]?.label ?? config.providerName;
   return (
     PURPLE("  ◆") +
-    GRAY(` ${providerLabel}`) +
-    CYAN(` [${config.model}]`) +
-    GRAY('   type /help for commands\n')
+    GRAY(` ${label}`) +
+    CYAN(`  [${config.model}]`) +
+    GRAY("   输入 / 调出指令菜单\n")
   );
 }
 
@@ -249,15 +182,14 @@ async function main() {
   if (args[0] === "--help" || args[0] === "-h") {
     console.log(BANNER);
     console.log(PURPLE("  Usage:"));
-    console.log("    " + PURPLE("sharkcode") + GRAY("                   — interactive mode"));
-    console.log("    " + PURPLE("sharkcode") + YELLOW(' "prompt"') + GRAY("         — single-shot mode"));
-    console.log("\n  " + PURPLE("Slash commands (in interactive mode):"));
-    printSlashHelp();
+    console.log("    " + PURPLE("sharkcode") + GRAY("          — 交互模式（直接启动）"));
+    console.log("    " + PURPLE("sharkcode") + YELLOW(' "prompt"') + GRAY("  — 单次执行"));
+    console.log(GRAY("\n  交互模式内输入 / 调出指令菜单\n"));
     return;
   }
 
   if (args[0] === "--version" || args[0] === "-v") {
-    console.log("sharkcode v0.3.0");
+    console.log("sharkcode v0.3.1");
     return;
   }
 
@@ -265,16 +197,15 @@ async function main() {
   if (args.length > 0) {
     const mc = readMultiConfig();
     const config = resolveConfig(mc);
-
     if (!config.apiKey) {
-      console.error(RED("❌ No API key found for provider: " + config.providerName));
-      console.error(GRAY("   Run sharkcode in interactive mode and use /key <your-key>"));
+      console.error(RED("❌ 未配置 API Key。请先运行 sharkcode 并输入 / 配置 Provider。"));
       process.exit(1);
     }
-
-    console.log(PURPLE("\n🦈 SharkCode") + GRAY(` | ${PROVIDERS[config.providerName]?.label ?? config.providerName} | model: ${config.model}\n`));
-    const messages: ModelMessage[] = [{ role: "user", content: args.join(" ") }];
-    await runAgent(messages, config);
+    console.log(
+      PURPLE("\n🦈 SharkCode") +
+      GRAY(` | ${PROVIDERS[config.providerName]?.label ?? config.providerName} | ${config.model}\n`)
+    );
+    await runAgent([{ role: "user", content: args.join(" ") }], config);
     return;
   }
 
@@ -282,76 +213,76 @@ async function main() {
   console.log(BANNER);
 
   let multiConfig = readMultiConfig();
-  let config = resolveConfig(multiConfig);
+  let config      = resolveConfig(multiConfig);
 
   console.log(statusLine(config));
 
-  // Warn if no key configured
   if (!config.apiKey) {
     console.log(
-      YELLOW("  ⚠ No API key configured for ") +
-      PURPLE(PROVIDERS[config.providerName]?.label ?? config.providerName) +
-      YELLOW(".")
+      YELLOW("  ⚠ 尚未配置 API Key。") +
+      GRAY("输入 / 然后选择「切换 / 配置 Provider」\n")
     );
-    console.log(GRAY("    Use /key <your-api-key> to set it, or /provider to switch.\n"));
   }
 
   let messages: ModelMessage[] = [];
 
   while (true) {
-    const input = await readLine(PURPLE("\n◆ "));
+    const raw = await readLine(PURPLE("\n◆ "));
 
-    if (input === null) {
-      console.log(GRAY("\nBye! 🦈"));
-      break;
-    }
+    if (raw === null) { console.log(GRAY("\nBye! 🦈")); break; }
 
-    const trimmed = input.trim();
+    const trimmed = raw.trim();
     if (!trimmed) continue;
 
-    // ── Plain exit shortcuts ──────────────────────────────────────────────
-    if (trimmed === "exit" || trimmed === "quit") {
-      console.log(GRAY("Bye! 🦈"));
-      break;
-    }
+    // Exit shortcuts
+    if (trimmed === "exit" || trimmed === "quit") { console.log(GRAY("Bye! 🦈")); break; }
 
-    // ── Slash commands ────────────────────────────────────────────────────
-    if (trimmed.startsWith("/")) {
-      const result = handleSlash(trimmed, multiConfig);
-      if (!result) continue;
-      multiConfig = result.multiConfig;
-      config = result.config;
-      if (result.clearHistory) messages = [];
-      if (result.exit) break;
+    // Bare "/" → command menu
+    if (trimmed === "/") {
+      const r = await showCommandMenu(multiConfig);
+      multiConfig = r.multiConfig; config = r.config;
+      if (r.clearHistory) messages = [];
+      if (r.exit) break;
       continue;
     }
 
-    // ── Normal chat ───────────────────────────────────────────────────────
+    // /provider, /model, /key → setup flow directly
+    if (
+      trimmed === "/provider" || trimmed.startsWith("/provider ") ||
+      trimmed === "/model"    || trimmed.startsWith("/model ")    ||
+      trimmed === "/key"      || trimmed.startsWith("/key ")
+    ) {
+      const r = await showSetupFlow(multiConfig);
+      multiConfig = r.multiConfig; config = r.config;
+      if (r.exit) break;
+      continue;
+    }
+
+    // Unknown slash command
+    if (trimmed.startsWith("/")) {
+      console.log(GRAY("  未知命令。输入 / 调出指令菜单\n"));
+      continue;
+    }
+
+    // ── Send message to agent ──────────────────────────────────────────────
     if (!config.apiKey) {
-      console.log(
-        YELLOW("\n  ⚠ No API key for ") +
-        PURPLE(PROVIDERS[config.providerName]?.label ?? config.providerName) +
-        YELLOW(". Set it with /key <your-api-key>\n")
-      );
+      console.log(YELLOW("  ⚠ 还未填写 API Key。输入 / → 切换 / 配置 Provider\n"));
       continue;
     }
 
     messages.push({ role: "user", content: trimmed });
-
     try {
       messages = await runAgent(messages, config);
-    } catch (err: unknown) {
-      const error = err as Error;
-      console.error(RED(`\n❌ Error: ${error.message}`));
-      if (error.message?.includes("401") || error.message?.includes("Unauthorized")) {
-        console.error(YELLOW("   Check your API key with /key <your-api-key>"));
-      }
-      messages = messages.slice(0, -1);
+    } catch (err) {
+      console.error(RED(`\n❌ ${String(err)}\n`));
+      // Remove the failed user message so history stays clean
+      messages.pop();
     }
   }
 }
 
 main().catch((err) => {
-  console.error(RED(`\n❌ Fatal: ${(err as Error).message}`));
+  console.error(chalk.red(`Fatal: ${String(err)}`));
   process.exit(1);
 });
+
