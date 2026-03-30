@@ -31,8 +31,9 @@ export const PROVIDERS: Record<string, { baseURL: string; defaultModel: string; 
     label: "DeepSeek 官网",
   },
   ark: {
-    baseURL: "https://ark.cn-beijing.volces.com/api/v3",
-    defaultModel: "deepseek-v3-250324",
+    // Coding Plan uses a dedicated endpoint — do NOT use /api/v3 (that's the pay-per-use endpoint)
+    baseURL: "https://ark.cn-beijing.volces.com/api/coding/v3",
+    defaultModel: "ark-code-latest",
     label: "方舟 Coding Plan",
   },
 };

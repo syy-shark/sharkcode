@@ -40,7 +40,7 @@ Start `sharkcode`, then:
 ```
 ◆ /provider ark              # switch to 方舟 Coding Plan
 ◆ /key sk-xxxxxxxxxx         # set API key (saved automatically)
-◆ /model deepseek-v3-250324  # optionally change model
+◆ /model ark-code-latest      # optionally change model
 ```
 
 ### Option 2: Config file
@@ -59,7 +59,7 @@ model = "deepseek-chat"
 [providers.ark]
 # API key from https://ark.cn-beijing.volces.com (方舟 Coding Plan)
 key = "sk-xxxxxx"
-model = "deepseek-v3-250324"
+model = "ark-code-latest"
 ```
 
 ### Option 3: Environment variables
