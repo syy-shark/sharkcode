@@ -150,17 +150,81 @@ async function showSetupFlow(multiConfig: MultiConfig): Promise<SlashResult> {
   }
 }
 
-// ─── Read one line from stdin ─────────────────────────────────────────────────
-async function readLine(prompt: string): Promise<string | null> {
+// ─── Read one line (raw mode: bare "/" triggers immediately without Enter) ────
+async function readLineRaw(promptStr: string): Promise<string | null> {
+  process.stdout.write(promptStr);
+
   return new Promise((resolve) => {
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    let answered = false;
-    rl.question(prompt, (answer) => {
-      answered = true;
-      rl.close();
-      resolve(answer);
-    });
-    rl.on("close", () => { if (!answered) resolve(null); });
+    let buffer = "";
+    let finished = false;
+
+    const finish = (value: string | null) => {
+      if (finished) return;
+      finished = true;
+      process.stdin.removeListener("data", onData);
+      try { process.stdin.setRawMode(false); } catch { /* not a TTY */ }
+      process.stdin.pause();
+      resolve(value);
+    };
+
+    const onData = (chunk: Buffer) => {
+      const str = chunk.toString("utf8");
+
+      // Ignore escape sequences (arrow keys, F-keys, etc.)
+      if (str.startsWith("\x1b")) return;
+
+      for (const ch of str) {
+        const code = ch.codePointAt(0)!;
+
+        if (code === 3 || code === 4) {          // Ctrl+C / Ctrl+D
+          process.stdout.write("\n");
+          finish(null);
+          return;
+        }
+        if (code === 13 || code === 10) {         // Enter
+          process.stdout.write("\n");
+          finish(buffer);
+          return;
+        }
+        if (code === 127 || code === 8) {         // Backspace
+          if (buffer.length > 0) {
+            const chars = [...buffer];
+            chars.pop();
+            buffer = chars.join("");
+            process.stdout.write("\b \b");
+          }
+          continue;
+        }
+        if (code < 32) continue;                  // other control chars → ignore
+
+        // Bare "/" as the very first character → trigger menu immediately
+        if (ch === "/" && buffer === "") {
+          process.stdout.write("\n");
+          finish("/");
+          return;
+        }
+
+        buffer += ch;
+        process.stdout.write(ch);
+      }
+    };
+
+    try {
+      process.stdin.setRawMode(true);
+      process.stdin.resume();
+      process.stdin.on("data", onData);
+    } catch {
+      // Not a TTY (e.g. piped input) — fall back to readline
+      finished = true; // prevent double-resolve
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      let answered = false;
+      rl.question(promptStr, (answer) => {
+        answered = true;
+        rl.close();
+        resolve(answer);
+      });
+      rl.on("close", () => { if (!answered) resolve(null); });
+    }
   });
 }
 
@@ -227,7 +291,7 @@ async function main() {
   let messages: ModelMessage[] = [];
 
   while (true) {
-    const raw = await readLine(PURPLE("\n◆ "));
+    const raw = await readLineRaw(PURPLE("\n◆ "));
 
     if (raw === null) { console.log(GRAY("\nBye! 🦈")); break; }
 
@@ -243,6 +307,7 @@ async function main() {
       multiConfig = r.multiConfig; config = r.config;
       if (r.clearHistory) messages = [];
       if (r.exit) break;
+      console.log(statusLine(config));   // ← show current provider + model
       continue;
     }
 
@@ -255,6 +320,7 @@ async function main() {
       const r = await showSetupFlow(multiConfig);
       multiConfig = r.multiConfig; config = r.config;
       if (r.exit) break;
+      console.log(statusLine(config));   // ← show current provider + model
       continue;
     }
 
