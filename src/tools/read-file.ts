@@ -6,7 +6,7 @@ import { resolve } from "path";
 export const readFileTool = tool({
   description:
     "Read the contents of a file at the given path. Returns the file content as a string.",
-  parameters: z.object({
+  inputSchema: z.object({
     path: z
       .string()
       .describe("File path to read (relative to current working directory)"),

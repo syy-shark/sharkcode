@@ -6,7 +6,7 @@ import { resolve } from "path";
 export const editFileTool = tool({
   description:
     "Edit a file by replacing an exact string match with new content. The old_str must match exactly one occurrence in the file.",
-  parameters: z.object({
+  inputSchema: z.object({
     path: z
       .string()
       .describe("File path to edit (relative to current working directory)"),

@@ -6,7 +6,7 @@ import { askPermission } from "../permission.ts";
 export const bashTool = tool({
   description:
     "Execute a shell command. The command will be shown to the user for approval before execution. Use this for running tests, installing packages, checking git status, etc.",
-  parameters: z.object({
+  inputSchema: z.object({
     command: z.string().describe("The shell command to execute"),
   }),
   execute: async ({ command }) => {

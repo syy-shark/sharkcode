@@ -7,7 +7,7 @@
 
 ```bash
 # 安装
-git clone https://github.com/user/sharkcode.git
+git clone https://github.com/syy-ex/sharkcode.git
 cd sharkcode && bun install
 
 # 配置 API Key（DeepSeek，比 OpenAI 便宜 10x）

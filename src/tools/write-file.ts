@@ -6,7 +6,7 @@ import { resolve, dirname } from "path";
 export const writeFileTool = tool({
   description:
     "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Creates parent directories as needed.",
-  parameters: z.object({
+  inputSchema: z.object({
     path: z
       .string()
       .describe("File path to write to (relative to current working directory)"),

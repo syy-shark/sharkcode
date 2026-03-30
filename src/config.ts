@@ -13,7 +13,7 @@ const CONFIG_DIR = join(homedir(), ".sharkcode");
 const CONFIG_FILE = join(CONFIG_DIR, "config.toml");
 
 const DEFAULT_CONFIG = `# Shark Code Configuration
-# https://github.com/user/sharkcode
+# https://github.com/syy-ex/sharkcode
 
 [api]
 # Get your API key from https://platform.deepseek.com
@@ -50,9 +50,7 @@ export function loadConfig(): Config {
 
   if (!apiKey) {
     console.error("❌ No API key found.");
-    console.error(
-      "   Set DEEPSEEK_API_KEY env var or edit ~/.sharkcode/config.toml"
-    );
+    console.error(`   Set DEEPSEEK_API_KEY env var or edit ${CONFIG_FILE}`);
     process.exit(1);
   }
 

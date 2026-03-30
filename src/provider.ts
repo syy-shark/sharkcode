@@ -5,6 +5,7 @@ export function createProvider(config: Config) {
   const provider = createOpenAI({
     baseURL: config.baseURL,
     apiKey: config.apiKey,
+    name: "deepseek",
   });
-  return provider(config.model);
+  return provider.chat(config.model);
 }
