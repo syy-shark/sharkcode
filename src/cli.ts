@@ -36,17 +36,23 @@ const GLYPHS: Record<string, number[][]> = {
 
 function renderWord(word: string, padLeft = 2): string[] {
   const letters = word.toUpperCase().split("").map((c) => GLYPHS[c]!);
+  // Use background-colored spaces instead of █ block characters.
+  // Block chars (U+2588) can render as 2 columns wide on some Windows fonts,
+  // causing the art to wrap and break after many lines of chat output.
+  // Spaces are always exactly 1 column wide — fully stable.
+  const ON  = chalk.bgHex("#a855f7")("  ");
+  const OFF = "  ";
   const rows: string[] = [];
   for (let row = 0; row < 5; row++) {
     let line = " ".repeat(padLeft);
     for (let i = 0; i < letters.length; i++) {
       const letter = letters[i]!;
       for (let col = 0; col < letter[row]!.length; col++) {
-        line += letter[row]![col] ? "██" : "  ";
+        line += letter[row]![col] ? ON : OFF;
       }
-      if (i < letters.length - 1) line += "  ";
+      if (i < letters.length - 1) line += OFF;
     }
-    rows.push(PURPLE(line));
+    rows.push(line);
   }
   return rows;
 }
