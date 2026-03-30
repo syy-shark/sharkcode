@@ -7,8 +7,10 @@ import {
   PROVIDERS,
   type Config,
   type MultiConfig,
+  type PermissionMode,
 } from "./config.ts";
 import { runAgent } from "./agent.ts";
+import { setPermissionMode, getPermissionMode } from "./permission.ts";
 import type { ModelMessage } from "ai";
 
 // ─── Colors ───────────────────────────────────────────────────────────────────
@@ -62,17 +64,24 @@ interface SlashResult {
 // ─── Interactive command menu (triggered by bare "/") ─────────────────────────
 async function showCommandMenu(multiConfig: MultiConfig): Promise<SlashResult> {
   console.log();
+  const permMode = getPermissionMode();
+  const permLabel = permMode === "full-access"
+    ? "⚡  权限模式：Full Access  " + chalk.dim("(点击切换回默认)")
+    : "🔐  权限模式：默认         " + chalk.dim("(点击开启 Full Access)");
+
   try {
     const action = await select({
       message: PURPLE("◆ 选择操作"),
       choices: [
         { name: "🔌  切换 / 配置 Provider", value: "provider" },
+        { name: permLabel,                  value: "permission" },
         { name: "🗑️  清空对话历史",          value: "clear"    },
         { name: "🚪  退出",                  value: "exit"     },
       ],
     });
     switch (action) {
-      case "provider": return showSetupFlow(multiConfig);
+      case "provider":   return showSetupFlow(multiConfig);
+      case "permission": return togglePermissionMode(multiConfig);
       case "clear":
         console.log(GRAY("\n  ✓ 对话已清空\n"));
         return { multiConfig, config: resolveConfig(multiConfig), clearHistory: true };
@@ -85,6 +94,30 @@ async function showCommandMenu(multiConfig: MultiConfig): Promise<SlashResult> {
     console.log(GRAY("\n  取消\n"));
   }
   return { multiConfig, config: resolveConfig(multiConfig) };
+}
+
+// ─── Toggle permission mode ───────────────────────────────────────────────────
+async function togglePermissionMode(multiConfig: MultiConfig): Promise<SlashResult> {
+  const current = getPermissionMode();
+  const next: PermissionMode = current === "full-access" ? "prompt" : "full-access";
+  setPermissionMode(next);
+
+  const updated: MultiConfig = { ...multiConfig, permissionMode: next };
+  saveMultiConfig(updated);
+
+  if (next === "full-access") {
+    console.log(
+      chalk.yellow("\n  ⚡ Full Access 已开启") +
+      GRAY(" — agent 将自动批准所有工具操作\n")
+    );
+  } else {
+    console.log(
+      chalk.green("\n  🔐 已恢复默认权限") +
+      GRAY(" — 每次工具调用前会询问\n")
+    );
+  }
+
+  return { multiConfig: updated, config: resolveConfig(updated) };
 }
 
 // ─── Setup flow: provider picker → API key input ──────────────────────────────
@@ -233,10 +266,15 @@ async function readLineRaw(promptStr: string): Promise<string | null> {
 // ─── Status line ─────────────────────────────────────────────────────────────
 function statusLine(config: Config): string {
   const label = PROVIDERS[config.providerName]?.label ?? config.providerName;
+  const permMode = getPermissionMode();
+  const permBadge = permMode === "full-access"
+    ? chalk.yellow("  ⚡ Full Access")
+    : GRAY("  🔐 默认权限");
   return (
     PURPLE("  ◆") +
     GRAY(` ${label}`) +
     CYAN(`  [${config.model}]`) +
+    permBadge +
     GRAY("   输入 / 调出指令菜单\n")
   );
 }
@@ -255,7 +293,7 @@ async function main() {
   }
 
   if (args[0] === "--version" || args[0] === "-v") {
-    console.log("sharkcode v0.3.4");
+    console.log("sharkcode v0.3.5");
     return;
   }
 
@@ -280,6 +318,9 @@ async function main() {
 
   let multiConfig = readMultiConfig();
   let config      = resolveConfig(multiConfig);
+
+  // Apply saved permission mode
+  setPermissionMode(multiConfig.permissionMode ?? "prompt");
 
   // Set raw mode ONCE for the entire REPL session.
   // readLineRaw only manages listeners; raw mode stays on throughout.

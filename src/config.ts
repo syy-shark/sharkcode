@@ -17,9 +17,12 @@ export interface ProviderEntry {
   model: string;
 }
 
+export type PermissionMode = "prompt" | "full-access";
+
 export interface MultiConfig {
   activeProvider: string;
   providers: Record<string, ProviderEntry>;
+  permissionMode: PermissionMode;
 }
 
 // ─── Provider registry ────────────────────────────────────────────────────────
@@ -54,6 +57,7 @@ function serializeConfig(mc: MultiConfig): string {
     "",
     "[default]",
     `provider = "${mc.activeProvider}"`,
+    `permission_mode = "${mc.permissionMode}"`,
     "",
     "[providers.deepseek]",
     "# API key from https://platform.deepseek.com",
@@ -77,6 +81,7 @@ function ensureConfig(): void {
   if (!existsSync(CONFIG_FILE)) {
     const initial: MultiConfig = {
       activeProvider: "deepseek",
+      permissionMode: "prompt",
       providers: {
         deepseek: { key: "", model: PROVIDERS.deepseek!.defaultModel },
         ark: { key: "", model: PROVIDERS.ark!.defaultModel },
@@ -118,9 +123,12 @@ export function readMultiConfig(): MultiConfig {
 
   // If we migrated from legacy format, the active provider is deepseek
   const activeProvider = defaultSection.provider || (legacy ? "deepseek" : "deepseek");
+  const permissionMode: PermissionMode =
+    (defaultSection.permission_mode as PermissionMode) === "full-access" ? "full-access" : "prompt";
 
   return {
     activeProvider,
+    permissionMode,
     providers: {
       deepseek: {
         key: deepseekKey,
