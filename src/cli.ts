@@ -1,5 +1,4 @@
 import chalk from "chalk";
-import * as readline from "readline";
 import { select, input } from "@inquirer/prompts";
 import {
   readMultiConfig,
@@ -150,8 +149,9 @@ async function showSetupFlow(multiConfig: MultiConfig): Promise<SlashResult> {
   }
 }
 
-// ─── Read one line (raw mode: bare "/" triggers immediately without Enter) ────
+// ─── Read one line (raw mode kept on by caller; bare "/" triggers immediately) ─
 async function readLineRaw(promptStr: string): Promise<string | null> {
+  // Raw mode is assumed to already be on. We only manage the data listener.
   process.stdout.write(promptStr);
 
   return new Promise((resolve) => {
@@ -162,8 +162,7 @@ async function readLineRaw(promptStr: string): Promise<string | null> {
       if (finished) return;
       finished = true;
       process.stdin.removeListener("data", onData);
-      try { process.stdin.setRawMode(false); } catch { /* not a TTY */ }
-      process.stdin.pause();
+      // Do NOT touch setRawMode or pause — caller owns that
       resolve(value);
     };
 
@@ -209,22 +208,7 @@ async function readLineRaw(promptStr: string): Promise<string | null> {
       }
     };
 
-    try {
-      process.stdin.setRawMode(true);
-      process.stdin.resume();
-      process.stdin.on("data", onData);
-    } catch {
-      // Not a TTY (e.g. piped input) — fall back to readline
-      finished = true; // prevent double-resolve
-      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-      let answered = false;
-      rl.question(promptStr, (answer) => {
-        answered = true;
-        rl.close();
-        resolve(answer);
-      });
-      rl.on("close", () => { if (!answered) resolve(null); });
-    }
+    process.stdin.on("data", onData);
   });
 }
 
@@ -279,6 +263,10 @@ async function main() {
   let multiConfig = readMultiConfig();
   let config      = resolveConfig(multiConfig);
 
+  // Set raw mode ONCE for the entire REPL session.
+  // readLineRaw only manages listeners; raw mode stays on throughout.
+  try { process.stdin.setRawMode(true); process.stdin.resume(); } catch { /* not a TTY */ }
+
   console.log(statusLine(config));
 
   if (!config.apiKey) {
@@ -307,7 +295,9 @@ async function main() {
       multiConfig = r.multiConfig; config = r.config;
       if (r.clearHistory) messages = [];
       if (r.exit) break;
-      console.log(statusLine(config));   // ← show current provider + model
+      // Restore raw mode after inquirer (which may have changed it)
+      try { process.stdin.setRawMode(true); process.stdin.resume(); } catch {}
+      console.log(statusLine(config));
       continue;
     }
 
@@ -320,7 +310,9 @@ async function main() {
       const r = await showSetupFlow(multiConfig);
       multiConfig = r.multiConfig; config = r.config;
       if (r.exit) break;
-      console.log(statusLine(config));   // ← show current provider + model
+      // Restore raw mode after inquirer
+      try { process.stdin.setRawMode(true); process.stdin.resume(); } catch {}
+      console.log(statusLine(config));
       continue;
     }
 
@@ -339,10 +331,13 @@ async function main() {
     messages.push({ role: "user", content: trimmed });
     try {
       messages = await runAgent(messages, config);
+      // Ensure raw mode is still on after agent runs
+      // (bash tool via askPermission uses raw mode too, so this is a safety net)
+      try { process.stdin.setRawMode(true); process.stdin.resume(); } catch {}
     } catch (err) {
       console.error(RED(`\n❌ ${String(err)}\n`));
-      // Remove the failed user message so history stays clean
       messages.pop();
+      try { process.stdin.setRawMode(true); process.stdin.resume(); } catch {}
     }
   }
 }
