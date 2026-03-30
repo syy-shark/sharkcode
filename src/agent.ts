@@ -102,7 +102,28 @@ export async function runAgent(
   let currentStep = 0;
   const thinkingSpinner = createSpinner("thinking...");
   let thinkingDone = false;
-  let lastWasNewline = true; // track whether we need to prefix a newline
+
+  // Track consecutive trailing newlines written to stdout so we can collapse
+  // the excess blank lines the LLM emits before/after tool calls.
+  let trailingNL = 0;
+
+  function writeOut(text: string) {
+    if (!text) return;
+    process.stdout.write(text);
+    for (const ch of text) {
+      if (ch === "\n") trailingNL++;
+      else trailingNL = 0;
+    }
+  }
+
+  // Collapse all but `keep` trailing blank lines using ANSI cursor-up + clear.
+  function collapseNL(keep = 1) {
+    if (trailingNL > keep) {
+      const remove = trailingNL - keep;
+      process.stdout.write(`\x1b[${remove}A\x1b[J`);
+      trailingNL = keep;
+    }
+  }
 
   // Tool-level spinner (one active at a time)
   let toolSpinner: ReturnType<typeof createSpinner> | null = null;
@@ -119,8 +140,9 @@ export async function runAgent(
 
     switch (event.type) {
       case "text-delta":
-        process.stdout.write(event.text);
-        lastWasNewline = event.text.endsWith("\n");
+        // Collapse excess blank lines between a tool result and next paragraph
+        if (trailingNL > 1 && event.text.trim() !== "") collapseNL(1);
+        writeOut(event.text);
         break;
 
       case "tool-call": {
@@ -129,8 +151,9 @@ export async function runAgent(
 
         const argHint = getArgHint(event.toolName, event.input);
 
-        // Ensure we're on a fresh line
-        if (!lastWasNewline) process.stdout.write("\n");
+        // Collapse the LLM's excess blank lines before the scan-line (keep 1)
+        if (trailingNL === 0) writeOut("\n");
+        collapseNL(1);
 
         // Purple scan-line flash
         await playScanLine();
@@ -145,7 +168,7 @@ export async function runAgent(
         registerToolSpinner(() => toolSpinner?.stop());
         toolSpinner.start();
 
-        lastWasNewline = false;
+        trailingNL = 0;
         break;
       }
 
@@ -160,7 +183,7 @@ export async function runAgent(
         process.stdout.write(
           `  ${chalk.green("✓")} ${chalk.dim(summary)}\n`
         );
-        lastWasNewline = true;
+        trailingNL = 1;
         break;
       }
 
@@ -173,7 +196,7 @@ export async function runAgent(
         process.stderr.write(
           chalk.red(`  ✗ [${event.toolName}] ${String(event.error)}\n`)
         );
-        lastWasNewline = true;
+        trailingNL = 1;
         break;
 
       case "finish-step":
@@ -184,7 +207,7 @@ export async function runAgent(
         if (toolSpinner) { toolSpinner.stop(); toolSpinner = null; unregisterToolSpinner(); }
         thinkingSpinner.stop();
         process.stderr.write(chalk.red(`\n❌ ${String(event.error)}\n`));
-        lastWasNewline = true;
+        trailingNL = 1;
         break;
     }
   }
@@ -193,7 +216,7 @@ export async function runAgent(
   thinkingSpinner.stop();
   if (toolSpinner) { toolSpinner.stop(); unregisterToolSpinner(); }
 
-  if (!lastWasNewline) process.stdout.write("\n");
+  if (trailingNL === 0) process.stdout.write("\n");
 
   const usage = await result.totalUsage;
   if (usage) {
