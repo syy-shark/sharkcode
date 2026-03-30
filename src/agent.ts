@@ -4,6 +4,33 @@ import { tools } from "./tools/index.ts";
 import { createProvider } from "./provider.ts";
 import type { Config } from "./config.ts";
 
+const PURPLE = chalk.hex("#a855f7");
+
+// ─── Spinner ──────────────────────────────────────────────────────────────────
+function createSpinner() {
+  const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+  let i = 0;
+  let timer: ReturnType<typeof setInterval> | null = null;
+
+  return {
+    start() {
+      process.stdout.write("\n");
+      timer = setInterval(() => {
+        process.stdout.write(
+          `\r${PURPLE(frames[i++ % frames.length]!)} ${chalk.gray("thinking...")}`
+        );
+      }, 80);
+    },
+    stop() {
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+        process.stdout.write("\r\x1b[K"); // clear the spinner line
+      }
+    },
+  };
+}
+
 function buildSystemPrompt(): string {
   return `You are Shark Code, an AI coding assistant. You help users with coding tasks by reading, writing, and editing files, and running shell commands.
 
@@ -40,8 +67,18 @@ export async function runAgent(
   });
 
   let currentStep = 0;
+  const spinner = createSpinner();
+  let spinnerStopped = false;
+
+  spinner.start();
 
   for await (const event of result.fullStream) {
+    // Stop spinner on the first real output
+    if (!spinnerStopped && (event.type === "text-delta" || event.type === "tool-call" || event.type === "error")) {
+      spinner.stop();
+      spinnerStopped = true;
+    }
+
     switch (event.type) {
       case "text-delta":
         process.stdout.write(event.text);
@@ -75,6 +112,11 @@ export async function runAgent(
         process.stderr.write(chalk.red(`\n❌ Error: ${String(event.error)}\n`));
         break;
     }
+  }
+
+  // Ensure spinner is always stopped (e.g. if stream ended with no output events)
+  if (!spinnerStopped) {
+    spinner.stop();
   }
 
   process.stdout.write("\n");
