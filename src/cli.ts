@@ -1,3 +1,6 @@
+import { readFileSync } from "fs";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
 import chalk from "chalk";
 import { select, input } from "@inquirer/prompts";
 import {
@@ -9,8 +12,9 @@ import {
   type MultiConfig,
   type PermissionMode,
 } from "./config.ts";
-import { runAgent } from "./agent.ts";
+import { runAgent, type RunAgentResult } from "./agent.ts";
 import { setPermissionMode, getPermissionMode } from "./permission.ts";
+import { createInterruptController, triggerInterrupt, wasInterrupted, resetInterrupt, isAwaitingPermission } from "./interrupt.ts";
 import type { ModelMessage } from "ai";
 
 // ─── Colors ───────────────────────────────────────────────────────────────────
@@ -20,6 +24,17 @@ const YELLOW = chalk.yellow;
 const GREEN  = chalk.green;
 const RED    = chalk.red;
 const CYAN   = chalk.cyan;
+
+// ─── Read version from package.json ───────────────────────────────────────────
+function getVersion(): string {
+  try {
+    const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+    return pkg.version ?? "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
 
 // ─── Purple pixel-art banner ──────────────────────────────────────────────────
 const GLYPHS: Record<string, number[][]> = {
@@ -314,7 +329,7 @@ function statusLine(config: Config): string {
     GRAY(` ${label}`) +
     CYAN(`  [${config.model}]`) +
     permBadge +
-    GRAY("   输入 / 调出指令菜单\n")
+    GRAY("   输入 / 调出指令菜单 · Esc 中断输出\n")
   );
 }
 
@@ -336,7 +351,7 @@ async function main() {
   }
 
   if (args[0] === "--version" || args[0] === "-v") {
-    console.log("sharkcode v0.5.0");
+    console.log(`sharkcode v${getVersion()}`);
     return;
   }
 
@@ -358,6 +373,7 @@ async function main() {
 
   // ── Interactive REPL mode ─────────────────────────────────────────────────
   console.log(BANNER);
+  console.log(GRAY(`  v${getVersion()}\n`));
 
   let multiConfig = readMultiConfig();
   let config      = resolveConfig(multiConfig);
@@ -427,6 +443,7 @@ ${PURPLE("  可用命令：")}
   ${GRAY("/model")}        ${GRAY("─ 切换模型")}
   ${GRAY("/help")}         ${GRAY("─ 显示此帮助")}
   ${GRAY("exit / quit")}   ${GRAY("─ 退出")}
+  ${GRAY("Esc")}           ${GRAY("─ 中断当前 Agent 输出")}
 
 ${PURPLE("  可用工具 (Agent 自动调用)：")}
   ${CYAN("read_file")}     ${GRAY("─ 读取文件（支持行号范围）")}
@@ -458,14 +475,35 @@ ${PURPLE("  项目配置：")}
     }
 
     messages.push({ role: "user", content: trimmed });
+
+    // Set up interrupt: listen for Escape key while agent is running
+    const abortSignal = createInterruptController();
+    const interruptListener = (chunk: Buffer) => {
+      const str = chunk.toString("utf8");
+      // Escape key = \x1b (but NOT escape sequences like arrow keys which are \x1b[...)
+      // We check for bare Escape: exactly 1 byte = 0x1b
+      if (str === "\x1b") {
+        triggerInterrupt();
+      }
+    };
+    process.stdin.on("data", interruptListener);
+
     try {
-      messages = await runAgent(messages, config);
-      // Ensure raw mode is still on after agent runs
-      // (bash tool via askPermission uses raw mode too, so this is a safety net)
-      try { process.stdin.setRawMode(true); process.stdin.resume(); } catch {}
+      const result = await runAgent(messages, config, abortSignal);
+      messages = result.messages;
+
+      if (result.interrupted) {
+        process.stderr.write(
+          GRAY("  按 Esc 已中断 · 可以继续输入新指令\n")
+        );
+      }
     } catch (err) {
       console.error(RED(`\n❌ ${String(err)}\n`));
       messages.pop();
+    } finally {
+      // Always clean up: remove interrupt listener, reset state, restore raw mode
+      process.stdin.removeListener("data", interruptListener);
+      resetInterrupt();
       try { process.stdin.setRawMode(true); process.stdin.resume(); } catch {}
     }
   }

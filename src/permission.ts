@@ -1,5 +1,6 @@
 import chalk from "chalk";
 import { stopToolSpinner } from "./spinnerState.ts";
+import { setAwaitingPermission } from "./interrupt.ts";
 
 const PURPLE = chalk.hex("#a855f7");
 const GRAY   = chalk.gray;
@@ -60,9 +61,11 @@ export async function askPermission(command: string): Promise<boolean> {
   process.stderr.write(PURPLE("  ◆ ") + GRAY("按键决定 › "));
 
   return new Promise((resolve) => {
+    setAwaitingPermission(true);
     const onData = (chunk: Buffer) => {
       const ch = chunk.toString("utf8")[0]?.toLowerCase() ?? "";
       process.stdin.removeListener("data", onData);
+      setAwaitingPermission(false);
 
       if (ch === "y") {
         process.stderr.write(GREEN("y  允许\n\n"));
