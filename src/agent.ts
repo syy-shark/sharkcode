@@ -9,7 +9,6 @@ import type { Config } from "./config.ts";
 import { registerToolSpinner, unregisterToolSpinner } from "./spinnerState.ts";
 
 const PURPLE = chalk.hex("#a855f7");
-const PURPLE_DIM = chalk.hex("#7c3aed");
 
 // ─── Tool display labels ──────────────────────────────────────────────────────
 const TOOL_LABELS: Record<string, { icon: string; verb: string }> = {
@@ -24,52 +23,222 @@ const TOOL_LABELS: Record<string, { icon: string; verb: string }> = {
   think:           { icon: "💭", verb: "thinking" },
 };
 
-// ─── Purple scan-line animation ───────────────────────────────────────────────
+// ─── Glow-beam sweep animation ────────────────────────────────────────────────
 function playScanLine(): Promise<void> {
   return new Promise((resolve) => {
     const cols = Math.min(process.stdout.columns ?? 80, 72);
-    const steps = 12;
-    const chars = "▏▎▍▌▋▊▉█▉▊▋▌▍▎▏";
+    const totalFrames = 20;
     let frame = 0;
+
     const t = setInterval(() => {
-      const pos = Math.floor((frame / steps) * cols);
-      const bar =
-        PURPLE_DIM("─".repeat(pos)) +
-        PURPLE(chars[frame % chars.length]!) +
-        chalk.dim("─".repeat(Math.max(0, cols - pos - 1)));
-      process.stdout.write(`\r${bar}`);
+      const pos = (frame / totalFrames) * cols;
+      let line = "";
+
+      for (let i = 0; i < cols; i++) {
+        const absDist = Math.abs(i - pos);
+        if (absDist < 1) {
+          line += chalk.hex("#f5f3ff")("█");
+        } else if (absDist < 2) {
+          line += chalk.hex("#e9d5ff")("▓");
+        } else if (absDist < 3) {
+          line += chalk.hex("#c084fc")("▒");
+        } else if (absDist < 5) {
+          line += chalk.hex("#7c3aed")("░");
+        } else if (i < pos - 5) {
+          line += PURPLE("─");
+        } else {
+          line += chalk.hex("#2e1065")("─");
+        }
+      }
+
+      process.stdout.write(`\r${line}`);
       frame++;
-      if (frame >= steps) {
+
+      if (frame > totalFrames) {
         clearInterval(t);
         process.stdout.write(`\r${PURPLE("─".repeat(cols))}\n`);
+        resolve();
+      }
+    }, 22);
+  });
+}
+
+// ─── Streaming text cursor (subtle pulsing block during text output) ─────────
+function createStreamCursor() {
+  const cursorFrames = ["█", "▓", "▒", "░", "▒", "▓"];
+  let frame = 0;
+  let timer: ReturnType<typeof setInterval> | null = null;
+  let lastCol = 0; // track how many chars to erase
+
+  return {
+    show() {
+      if (timer) return;
+      timer = setInterval(() => {
+        const ch = cursorFrames[frame % cursorFrames.length]!;
+        const colored = chalk.hex("#a855f7")(ch);
+        // Erase previous cursor char, write new one
+        if (lastCol > 0) process.stdout.write("\b \b");
+        process.stdout.write(colored);
+        lastCol = 1;
+        frame++;
+      }, 80);
+    },
+    hide() {
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+        if (lastCol > 0) {
+          process.stdout.write("\b \b");
+          lastCol = 0;
+        }
+      }
+    },
+  };
+}
+
+// ─── Gradient-pulse spinner ───────────────────────────────────────────────────
+function createSpinner(label: string) {
+  const barLen = 18;
+  const pulseW = 4;
+  const gradient = [
+    "#2e1065", "#4c1d95", "#5b21b6", "#6d28d9", "#7c3aed",
+    "#8b5cf6", "#a855f7", "#c084fc", "#d8b4fe", "#e9d5ff",
+  ];
+  const sparks = ["✦", "◆", "✧", "◇"];
+  let frame = 0;
+  let timer: ReturnType<typeof setInterval> | null = null;
+
+  return {
+    start() {
+      timer = setInterval(() => {
+        const spark = chalk.hex("#c084fc")(sparks[frame % sparks.length]!);
+        const center = (frame % (barLen + pulseW * 2)) - pulseW;
+        let bar = "";
+        for (let i = 0; i < barLen; i++) {
+          const d = Math.abs(i - center);
+          if (d <= pulseW) {
+            const ratio = (pulseW - d) / pulseW;
+            const idx = Math.round(ratio * (gradient.length - 1));
+            bar += chalk.hex(gradient[idx]!)("━");
+          } else {
+            bar += chalk.hex("#2e1065")("━");
+          }
+        }
+        process.stdout.write(`\r  ${spark} ${bar} ${chalk.gray(label)}`);
+        frame++;
+      }, 50);
+    },
+    stop() {
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+        process.stdout.write("\r\x1b[K");
+      }
+    },
+  };
+}
+
+// ─── File-creation matrix cascade ─────────────────────────────────────────────
+function playCreateFileAnim(fileName: string): Promise<void> {
+  return new Promise((resolve) => {
+    const cols = Math.min(process.stdout.columns ?? 80, 60);
+    const codeChars = "{}[]<>/=+_()#@&*;:01ABCDEFabcdef";
+    const totalFrames = 10;
+    let frame = 0;
+
+    const t = setInterval(() => {
+      let line = "  ";
+      const fillTo = Math.floor(((frame + 1) / totalFrames) * (cols - 4));
+      for (let i = 0; i < cols - 4; i++) {
+        if (i < fillTo) {
+          const ch = codeChars[Math.floor(Math.random() * codeChars.length)]!;
+          if (i > fillTo - 3) {
+            line += chalk.hex("#e9d5ff")(ch);
+          } else if (Math.random() > 0.6) {
+            line += chalk.hex("#7c3aed")(ch);
+          } else {
+            line += chalk.hex("#4c1d95")(ch);
+          }
+        } else {
+          line += " ";
+        }
+      }
+      process.stdout.write(`\r${line}`);
+      frame++;
+
+      if (frame >= totalFrames) {
+        clearInterval(t);
+        // Resolve to a styled "creating" message
+        const label = `  📝 ${chalk.hex("#c084fc")("creating")}${chalk.dim(" › ")}${chalk.white(fileName)}`;
+        process.stdout.write(`\r\x1b[K${label}\n`);
         resolve();
       }
     }, 30);
   });
 }
 
-// ─── Spinner factory ──────────────────────────────────────────────────────────
-function createSpinner(label: string) {
-  const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-  let i = 0;
-  let timer: ReturnType<typeof setInterval> | null = null;
+// ─── Quick data-scan animation (for read/search tools) ────────────────────────
+function playDataScanAnim(): Promise<void> {
+  return new Promise((resolve) => {
+    const cols = Math.min(process.stdout.columns ?? 80, 50);
+    const scanChars = "░▒▓█▓▒░";
+    const totalFrames = 8;
+    let frame = 0;
 
-  return {
-    start() {
-      timer = setInterval(() => {
-        process.stdout.write(
-          `\r  ${PURPLE(frames[i++ % frames.length]!)} ${chalk.gray(label)}`
-        );
-      }, 80);
-    },
-    stop() {
-      if (timer) {
-        clearInterval(timer);
-        timer = null;
-        process.stdout.write("\r\x1b[K"); // clear spinner line
+    const t = setInterval(() => {
+      let line = "  ";
+      for (let i = 0; i < cols - 4; i++) {
+        const wave = Math.sin((i + frame * 3) * 0.3);
+        if (wave > 0.5) {
+          line += chalk.hex("#c084fc")(scanChars[Math.floor(Math.random() * scanChars.length)]!);
+        } else if (wave > 0) {
+          line += chalk.hex("#6d28d9")("·");
+        } else {
+          line += chalk.hex("#2e1065")("·");
+        }
       }
-    },
-  };
+      process.stdout.write(`\r${line}`);
+      frame++;
+
+      if (frame >= totalFrames) {
+        clearInterval(t);
+        process.stdout.write(`\r\x1b[K`);
+        resolve();
+      }
+    }, 25);
+  });
+}
+
+// ─── Command execution pulse (for bash tool) ─────────────────────────────────
+function playCommandPulseAnim(): Promise<void> {
+  return new Promise((resolve) => {
+    const cols = Math.min(process.stdout.columns ?? 80, 50);
+    const totalFrames = 6;
+    let frame = 0;
+
+    const t = setInterval(() => {
+      const progress = (frame + 1) / totalFrames;
+      const fillLen = Math.floor(progress * (cols - 4));
+      let line = "  ";
+      for (let i = 0; i < cols - 4; i++) {
+        if (i < fillLen) {
+          line += chalk.hex("#22c55e")("▸");
+        } else if (i === fillLen) {
+          line += chalk.hex("#4ade80")("▸");
+        } else {
+          line += chalk.hex("#1a2e05")("▸");
+        }
+      }
+      process.stdout.write(`\r${line}`);
+      frame++;
+
+      if (frame >= totalFrames) {
+        clearInterval(t);
+        process.stdout.write(`\r\x1b[K`);
+        resolve();
+      }
+    }, 25);
+  });
 }
 
 // ─── Project context detection ────────────────────────────────────────────────
@@ -220,12 +389,15 @@ export async function runAgent(
     messages,
     tools,
     maxRetries: 2,
+    maxOutputTokens: 16384,
     stopWhen: stepCountIs(50),
   });
 
   let currentStep = 0;
   const thinkingSpinner = createSpinner("thinking...");
+  const streamCursor = createStreamCursor();
   let thinkingDone = false;
+  let isStreaming = false;
 
   // Track consecutive trailing newlines written to stdout so we can collapse
   // the excess blank lines the LLM emits before/after tool calls.
@@ -266,10 +438,18 @@ export async function runAgent(
       case "text-delta":
         // Collapse excess blank lines between a tool result and next paragraph
         if (trailingNL > 1 && event.text.trim() !== "") collapseNL(1);
+        // Hide cursor before writing, then re-show for live effect
+        streamCursor.hide();
         writeOut(event.text);
+        if (!isStreaming) isStreaming = true;
+        streamCursor.show();
         break;
 
       case "tool-call": {
+        // Hide streaming cursor when transitioning to tool execution
+        streamCursor.hide();
+        isStreaming = false;
+
         const meta = TOOL_LABELS[event.toolName] ?? { icon: "🔧", verb: "running" };
         currentToolName = event.toolName;
 
@@ -281,6 +461,20 @@ export async function runAgent(
 
         // Purple scan-line flash
         await playScanLine();
+
+        // Tool-specific animations
+        if ((event.toolName === "write_file" || event.toolName === "edit_file") && argHint) {
+          await playCreateFileAnim(argHint);
+        } else if (event.toolName === "bash") {
+          await playCommandPulseAnim();
+        } else if (
+          event.toolName === "read_file" ||
+          event.toolName === "grep" ||
+          event.toolName === "glob" ||
+          event.toolName === "list_directory"
+        ) {
+          await playDataScanAnim();
+        }
 
         // Compact tool header: icon + verb + path on ONE line
         process.stdout.write(
@@ -324,10 +518,13 @@ export async function runAgent(
         break;
 
       case "finish-step":
+        streamCursor.hide();
+        isStreaming = false;
         currentStep++;
         break;
 
       case "error":
+        streamCursor.hide();
         if (toolSpinner) { toolSpinner.stop(); toolSpinner = null; unregisterToolSpinner(); }
         thinkingSpinner.stop();
         process.stderr.write(chalk.red(`\n❌ ${String(event.error)}\n`));
@@ -338,9 +535,23 @@ export async function runAgent(
 
   // Ensure spinners are always stopped
   thinkingSpinner.stop();
+  streamCursor.hide();
   if (toolSpinner) { toolSpinner.stop(); unregisterToolSpinner(); }
 
   if (trailingNL === 0) process.stdout.write("\n");
+
+  // Detect truncated output (e.g. CSS file written halfway because token limit hit)
+  const finishReason = await result.finishReason;
+  if (finishReason === "length") {
+    process.stderr.write(
+      chalk.yellow("\n  ⚠ 输出因 token 限制被截断。") +
+      chalk.gray(" 大文件可能未完整写入，请检查并重试（可尝试分段生成）。\n")
+    );
+  } else if (finishReason === "content-filter") {
+    process.stderr.write(
+      chalk.yellow("\n  ⚠ 输出被内容过滤器截断。\n")
+    );
+  }
 
   const usage = await result.totalUsage;
   if (usage) {
