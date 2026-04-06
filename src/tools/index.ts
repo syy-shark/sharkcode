@@ -7,6 +7,7 @@ import { grepTool } from "./grep.ts";
 import { listDirectoryTool } from "./list-directory.ts";
 import { webFetchTool } from "./web-fetch.ts";
 import { thinkTool } from "./think.ts";
+import { playwrightTool } from "./playwright.ts";
 
 export const tools = {
   read_file: readFileTool,
@@ -18,4 +19,5 @@ export const tools = {
   list_directory: listDirectoryTool,
   web_fetch: webFetchTool,
   think: thinkTool,
+  playwright: playwrightTool,
 };
