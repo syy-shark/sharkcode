@@ -403,6 +403,12 @@ export async function runAgent(
   // the excess blank lines the LLM emits before/after tool calls.
   let trailingNL = 0;
 
+  // Tool-input composing state: bridges the gap between model starting to
+  // generate tool arguments and the complete tool-call event arriving.
+  let composingSpinner: ReturnType<typeof createSpinner> | null = null;
+  let composingToolName = "";
+  let composingBytes = 0;
+
   function writeOut(text: string) {
     if (!text) return;
     process.stdout.write(text);
@@ -429,7 +435,14 @@ export async function runAgent(
 
   for await (const event of result.fullStream) {
     // Stop thinking spinner on first real output
-    if (!thinkingDone && (event.type === "text-delta" || event.type === "tool-call" || event.type === "error")) {
+    if (
+      !thinkingDone &&
+      (event.type === "text-delta" ||
+        event.type === "tool-call" ||
+        event.type === "tool-input-start" ||
+        event.type === "reasoning-delta" ||
+        event.type === "error")
+    ) {
       thinkingSpinner.stop();
       thinkingDone = true;
     }
@@ -449,6 +462,14 @@ export async function runAgent(
         // Hide streaming cursor when transitioning to tool execution
         streamCursor.hide();
         isStreaming = false;
+
+        // Stop composing spinner if still running
+        if (composingSpinner) {
+          composingSpinner.stop();
+          composingSpinner = null;
+          composingToolName = "";
+          composingBytes = 0;
+        }
 
         const meta = TOOL_LABELS[event.toolName] ?? { icon: "🔧", verb: "running" };
         currentToolName = event.toolName;
@@ -517,6 +538,88 @@ export async function runAgent(
         trailingNL = 1;
         break;
 
+      // ── Tool-input streaming (bridges the "frozen" gap during large arg generation) ──
+      case "tool-input-start": {
+        // Model just started generating tool arguments — show a composing spinner
+        streamCursor.hide();
+        isStreaming = false;
+
+        composingToolName = event.toolName;
+        composingBytes = 0;
+
+        const meta = TOOL_LABELS[event.toolName] ?? { icon: "🔧", verb: "running" };
+        const label = `composing ${meta.verb} input...`;
+        composingSpinner = createSpinner(label);
+        composingSpinner.start();
+        break;
+      }
+
+      case "tool-input-delta": {
+        // Model is still generating tool arguments — keep spinner alive,
+        // update byte counter so user sees continuous progress
+        composingBytes += event.delta.length;
+        if (composingSpinner && composingBytes > 500) {
+          // Update the spinner label with byte count, but only every ~2KB to avoid thrash
+          const kb = (composingBytes / 1024).toFixed(1);
+          const kbRounded = Math.floor(composingBytes / 2048);
+          const prevKbRounded = Math.floor((composingBytes - event.delta.length) / 2048);
+          if (kbRounded !== prevKbRounded || composingBytes - event.delta.length <= 500) {
+            const meta = TOOL_LABELS[composingToolName] ?? { icon: "🔧", verb: "running" };
+            composingSpinner.stop();
+            composingSpinner = createSpinner(`composing ${meta.verb} input... ${kb}KB`);
+            composingSpinner.start();
+          }
+        }
+        break;
+      }
+
+      case "tool-input-end": {
+        // Tool argument generation complete — clean up composing spinner
+        // (tool-call event will follow immediately and start its own animation)
+        if (composingSpinner) {
+          composingSpinner.stop();
+          composingSpinner = null;
+        }
+        composingToolName = "";
+        composingBytes = 0;
+        break;
+      }
+
+      // ── Reasoning/thinking events (for models like DeepSeek R1, o1) ──
+      case "reasoning-start": {
+        // Model entered reasoning mode — show a thinking indicator
+        if (!thinkingDone) {
+          // Already have thinkingSpinner running
+        } else {
+          // Restart thinking spinner for multi-step reasoning
+          streamCursor.hide();
+          thinkingSpinner.start();
+        }
+        break;
+      }
+
+      case "reasoning-delta": {
+        // Could optionally display reasoning text; for now just keep spinner alive
+        break;
+      }
+
+      case "reasoning-end": {
+        thinkingSpinner.stop();
+        break;
+      }
+
+      // ── Step lifecycle ──
+      case "start-step": {
+        // New step starting — if we're past step 0, show a subtle separator
+        if (currentStep > 0) {
+          streamCursor.hide();
+          const cols = Math.min(process.stdout.columns ?? 80, 50);
+          process.stdout.write(`  ${chalk.hex("#2e1065")("·".repeat(cols - 4))}\n`);
+          trailingNL = 1;
+        }
+        break;
+      }
+
       case "finish-step":
         streamCursor.hide();
         isStreaming = false;
@@ -525,6 +628,7 @@ export async function runAgent(
 
       case "error":
         streamCursor.hide();
+        if (composingSpinner) { composingSpinner.stop(); composingSpinner = null; }
         if (toolSpinner) { toolSpinner.stop(); toolSpinner = null; unregisterToolSpinner(); }
         thinkingSpinner.stop();
         process.stderr.write(chalk.red(`\n❌ ${String(event.error)}\n`));
@@ -536,6 +640,7 @@ export async function runAgent(
   // Ensure spinners are always stopped
   thinkingSpinner.stop();
   streamCursor.hide();
+  if (composingSpinner) { composingSpinner.stop(); composingSpinner = null; }
   if (toolSpinner) { toolSpinner.stop(); unregisterToolSpinner(); }
 
   if (trailingNL === 0) process.stdout.write("\n");
