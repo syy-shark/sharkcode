@@ -21,6 +21,7 @@ const TOOL_LABELS: Record<string, { icon: string; verb: string }> = {
   list_directory:  { icon: "📂", verb: "listing" },
   web_fetch:       { icon: "🌐", verb: "fetching" },
   think:           { icon: "💭", verb: "thinking" },
+  playwright:      { icon: "🎭", verb: "browser" },
 };
 
 // ─── Glow-beam sweep animation ────────────────────────────────────────────────
@@ -314,7 +315,7 @@ function getGitContext(): string | null {
 
 function buildSystemPrompt(): string {
   const os = process.platform === "win32" ? "Windows" : process.platform === "darwin" ? "macOS" : "Linux";
-  const shell = process.platform === "win32" ? "PowerShell" : "bash";
+  const shell = process.platform === "win32" ? "cmd.exe" : "bash";
 
   const parts: string[] = [];
 
@@ -351,46 +352,164 @@ Available tools:
 - read_file: Read file contents (supports line ranges and line numbers)
 - write_file: Create or overwrite files (creates parent directories)
 - edit_file: Find and replace an exact string in a file
-- bash: Execute shell commands (may require user approval)
+- bash: Execute shell commands. Set background=true for dev servers and long-running processes.
 - glob: Find files by glob pattern (e.g. '**/*.ts', 'src/**/*.{js,tsx}')
 - grep: Search for text/regex across files with line numbers
 - list_directory: List directory contents as a tree with file sizes
 - web_fetch: Fetch content from URLs (HTML auto-converted to text)
-- think: Plan your approach before complex multi-step tasks`);
+- think: Plan your approach before complex multi-step tasks
+- playwright: Control a visible Chromium browser that opens on screen. Actions: navigate, screenshot, click, fill, press, get_text, get_html, eval_js, wait_for, go_back, reload, close.
+  Use playwright to: test web apps, take screenshots, automate browser interactions, scrape pages, verify UI works.
+  The browser window is visible so you and the user can watch it in real-time. Session persists across calls.
+  LOGIN PAGES: When you encounter a login/auth page (login form, sign-in, OAuth, CAPTCHA, etc.):
+    - Do NOT guess credentials or blindly click buttons on the login page.
+    - IMMEDIATELY ask the user for their username/email and password.
+    - Wait for the user to provide credentials before proceeding.
+    - Then use playwright fill to enter the credentials and submit the form.
+    - If login fails, tell the user and ask them to verify their credentials.
+    - If there is a CAPTCHA or 2FA, tell the user and ask them to complete it manually in the visible browser window, then continue after they confirm.`);
 
-  // Guidelines
+  // Core behavior
   parts.push(`
-Guidelines:
-1. EXPLORE FIRST: Use glob, grep, and list_directory to understand the codebase before making changes
-2. ALWAYS read a file before editing it — never edit blind
-3. Use think tool to plan multi-step changes before starting
-4. Use edit_file for surgical changes, write_file for new files
-5. After making changes, verify them (re-read the file, run tests if applicable)
-6. When using bash, prefer ${shell}-compatible commands
-7. Keep changes minimal and focused on the user's request
-8. Summarize what you changed when done
-9. If a task is unclear, ask for clarification
-10. Consider edge cases and error handling
-11. Respect existing code style and conventions
-12. For large refactors, make changes incrementally and verify each step`);
+Core behavior:
+- ACT FIRST, explain later. When the user asks you to do something, DO IT immediately.
+- NEVER explain steps you could execute. If you can run a command, run it.
+- NEVER say "you can run..." or "try running..." — just run it yourself with the bash tool.
+- Be concise. After completing a task, briefly state what you did, not what you're about to do.
+- If a task is unclear, ask ONE clarifying question, then act.`);
+
+  // Code editing guidelines
+  parts.push(`
+Code editing:
+- ALWAYS read a file before editing it — never edit blind.
+- Use edit_file for surgical changes, write_file for new files.
+- After making changes, verify them (re-read the file, run tests if applicable).
+- Keep changes minimal and focused. Respect existing code style.
+- For large refactors, make changes incrementally and verify each step.`);
+
+  // Execution guidelines
+  parts.push(`
+Execution:
+- When using bash, use ${shell}-compatible commands. The bash tool runs commands via ${shell}.
+- Run commands directly. Do not ask "should I run this?" — just run it.
+- If a command fails, diagnose the error and retry with a fix.
+- For dev servers and long-running processes, ALWAYS use bash with background=true.
+  This spawns the process detached so it keeps running and doesn't block.
+  Example: bash({ command: "python -m http.server 8080", background: true })`);
+
+  // Project startup — the key missing piece
+  parts.push(`
+Project startup (CRITICAL — when user asks to "start", "run", "launch", "open" a project):
+1. Check package.json scripts, Makefile, docker-compose.yml, etc. to find the start command.
+2. If dependencies aren't installed, install them first (npm install / pnpm install / bun install).
+3. Start the dev server with background=true so it keeps running:
+   bash({ command: "npm run dev", background: true })
+   Common commands: npm run dev, pnpm dev, bun run dev, npm start, python -m http.server, flask run, cargo run, go run .
+4. After the server starts, open it in the browser with a SEPARATE bash call:${
+    process.platform === "win32"
+      ? `\n   bash({ command: 'start http://localhost:PORT' })`
+      : process.platform === "darwin"
+      ? `\n   bash({ command: 'open http://localhost:PORT' })`
+      : `\n   bash({ command: 'xdg-open http://localhost:PORT' })`
+  }
+5. Do NOT explain how to start the project. Just start it.`);
+
+  // URL & browser
+  parts.push(`
+Opening URLs / browsers:
+- When user says "open" a URL or asks to see something in the browser, use bash to open it:${
+    process.platform === "win32"
+      ? `\n  bash({ command: 'start "URL"' })  — uses cmd.exe start command`
+      : process.platform === "darwin"
+      ? `\n  bash({ command: 'open "URL"' })`
+      : `\n  bash({ command: 'xdg-open "URL"' })`
+  }
+- Do NOT just print the URL — actually open it.`);
+
+  // Exploration
+  parts.push(`
+Exploration:
+- Use glob, grep, and list_directory to understand unfamiliar codebases.
+- Explore before making changes to code you haven't seen.
+- Use think tool to plan multi-step changes before starting.`);
 
   return parts.join("\n");
 }
 
+// ─── Message history compaction ───────────────────────────────────────────────
+// Truncate tool results in older messages to prevent token bloat.
+// Keeps the last `keepRecent` messages intact; older tool results are capped.
+function compactMessages(messages: ModelMessage[], keepRecent = 4): ModelMessage[] {
+  if (messages.length <= keepRecent) return messages;
+
+  const COMPACT_LIMIT = 1_500;
+  const cutoff = messages.length - keepRecent;
+
+  return messages.map((msg, idx) => {
+    if (idx >= cutoff) return msg; // recent — keep intact
+    if (msg.role !== "tool") return msg;
+
+    // Deep-clone and truncate tool result content
+    const content = (msg.content as Array<Record<string, unknown>>).map((part) => {
+      if (part.type !== "tool-result") return part;
+
+      const output = part.output as Record<string, unknown> | undefined;
+      if (!output || typeof output !== "object") return part;
+
+      if (output.type === "text" && typeof output.value === "string") {
+        if ((output.value as string).length > COMPACT_LIMIT) {
+          return {
+            ...part,
+            output: {
+              ...output,
+              value: (output.value as string).slice(0, COMPACT_LIMIT) + "\n...(truncated from history)",
+            },
+          };
+        }
+      } else if (output.type === "json") {
+        const serialized = JSON.stringify(output.value);
+        if (serialized.length > COMPACT_LIMIT) {
+          return {
+            ...part,
+            output: {
+              type: "text" as const,
+              value: serialized.slice(0, COMPACT_LIMIT) + "\n...(truncated from history)",
+            },
+          };
+        }
+      }
+      return part;
+    });
+
+    return { ...msg, content } as ModelMessage;
+  });
+}
+
+export interface RunAgentResult {
+  messages: ModelMessage[];
+  interrupted: boolean;
+  /** Partial assistant text collected before interruption (empty if not interrupted) */
+  partialText: string;
+}
+
 export async function runAgent(
   messages: ModelMessage[],
-  config: Config
-): Promise<ModelMessage[]> {
+  config: Config,
+  abortSignal?: AbortSignal,
+): Promise<RunAgentResult> {
   const model = createProvider(config);
+
+  const compacted = compactMessages(messages);
 
   const result = streamText({
     model,
     system: buildSystemPrompt(),
-    messages,
+    messages: compacted,
     tools,
     maxRetries: 2,
     maxOutputTokens: 16384,
     stopWhen: stepCountIs(50),
+    abortSignal,
   });
 
   let currentStep = 0;
@@ -398,6 +517,8 @@ export async function runAgent(
   const streamCursor = createStreamCursor();
   let thinkingDone = false;
   let isStreaming = false;
+  let interrupted = false;
+  let partialText = "";
 
   // Track consecutive trailing newlines written to stdout so we can collapse
   // the excess blank lines the LLM emits before/after tool calls.
@@ -433,27 +554,31 @@ export async function runAgent(
 
   thinkingSpinner.start();
 
-  for await (const event of result.fullStream) {
-    // Stop thinking spinner on first real output
-    if (
-      !thinkingDone &&
-      (event.type === "text-delta" ||
-        event.type === "tool-call" ||
-        event.type === "tool-input-start" ||
-        event.type === "reasoning-delta" ||
-        event.type === "error")
-    ) {
-      thinkingSpinner.stop();
-      thinkingDone = true;
-    }
+  try {
+    for await (const event of result.fullStream) {
+      // Stop thinking spinner on first real output
+      if (
+        !thinkingDone &&
+        (event.type === "text-delta" ||
+          event.type === "tool-call" ||
+          event.type === "tool-input-start" ||
+          event.type === "reasoning-delta" ||
+          event.type === "error")
+      ) {
+        thinkingSpinner.stop();
+        thinkingDone = true;
+      }
 
     switch (event.type) {
       case "text-delta":
         // Collapse excess blank lines between a tool result and next paragraph
         if (trailingNL > 1 && event.text.trim() !== "") collapseNL(1);
+        // Prevent accumulating multiple blank lines — collapse immediately
+        if (trailingNL >= 2) collapseNL(1);
         // Hide cursor before writing, then re-show for live effect
         streamCursor.hide();
         writeOut(event.text);
+        partialText += event.text;
         if (!isStreaming) isStreaming = true;
         streamCursor.show();
         break;
@@ -476,28 +601,13 @@ export async function runAgent(
 
         const argHint = getArgHint(event.toolName, event.input);
 
-        // Collapse the LLM's excess blank lines before the scan-line (keep 1)
+        // Collapse ALL trailing blank lines — keep zero so tool header is tight
+        collapseNL(0);
         if (trailingNL === 0) writeOut("\n");
-        collapseNL(1);
 
-        // Purple scan-line flash
-        await playScanLine();
-
-        // Tool-specific animations
-        if ((event.toolName === "write_file" || event.toolName === "edit_file") && argHint) {
-          await playCreateFileAnim(argHint);
-        } else if (event.toolName === "bash") {
-          await playCommandPulseAnim();
-        } else if (
-          event.toolName === "read_file" ||
-          event.toolName === "grep" ||
-          event.toolName === "glob" ||
-          event.toolName === "list_directory"
-        ) {
-          await playDataScanAnim();
-        }
-
-        // Compact tool header: icon + verb + path on ONE line
+        // Thin separator + compact tool header on ONE line
+        const cols = Math.min(process.stdout.columns ?? 80, 60);
+        process.stdout.write(`  ${chalk.hex("#4c1d95")("─".repeat(cols - 4))}\n`);
         process.stdout.write(
           `  ${meta.icon} ${PURPLE(meta.verb)}${argHint ? chalk.dim(" › ") + chalk.white(argHint) : ""}\n`
         );
@@ -543,6 +653,10 @@ export async function runAgent(
         // Model just started generating tool arguments — show a composing spinner
         streamCursor.hide();
         isStreaming = false;
+
+        // Collapse ALL trailing blank lines so spinner appears tight below content
+        collapseNL(0);
+        if (trailingNL === 0) writeOut("\n");
 
         composingToolName = event.toolName;
         composingBytes = 0;
@@ -610,13 +724,7 @@ export async function runAgent(
 
       // ── Step lifecycle ──
       case "start-step": {
-        // New step starting — if we're past step 0, show a subtle separator
-        if (currentStep > 0) {
-          streamCursor.hide();
-          const cols = Math.min(process.stdout.columns ?? 80, 50);
-          process.stdout.write(`  ${chalk.hex("#2e1065")("·".repeat(cols - 4))}\n`);
-          trailingNL = 1;
-        }
+        // New step — no separator; the tool header line is enough visual break
         break;
       }
 
@@ -636,12 +744,42 @@ export async function runAgent(
         break;
     }
   }
+  } catch (err: unknown) {
+    // Handle abort (user pressed Escape)
+    if (
+      err instanceof Error &&
+      (err.name === "AbortError" || err.message.includes("abort"))
+    ) {
+      interrupted = true;
+    } else {
+      // Re-throw non-abort errors
+      throw err;
+    }
+  }
 
   // Ensure spinners are always stopped
   thinkingSpinner.stop();
   streamCursor.hide();
   if (composingSpinner) { composingSpinner.stop(); composingSpinner = null; }
   if (toolSpinner) { toolSpinner.stop(); unregisterToolSpinner(); }
+
+  if (interrupted) {
+    // Show interruption indicator
+    process.stdout.write(chalk.yellow("\n  ⏹ 已中断\n"));
+
+    // Return partial conversation — include whatever assistant text we got
+    if (partialText.trim()) {
+      return {
+        messages: [
+          ...messages,
+          { role: "assistant" as const, content: partialText + "\n\n[interrupted by user]" },
+        ],
+        interrupted: true,
+        partialText,
+      };
+    }
+    return { messages, interrupted: true, partialText };
+  }
 
   if (trailingNL === 0) process.stdout.write("\n");
 
@@ -668,9 +806,13 @@ export async function runAgent(
   // Append response messages to conversation history for multi-turn support
   try {
     const { messages: responseMessages } = await result.response;
-    return [...messages, ...responseMessages] as ModelMessage[];
+    return {
+      messages: [...messages, ...responseMessages] as ModelMessage[],
+      interrupted: false,
+      partialText,
+    };
   } catch {
-    return messages;
+    return { messages, interrupted: false, partialText };
   }
 }
 
