@@ -40,17 +40,28 @@ export const readFileTool = tool({
 
       const selected = lines.slice(start - 1, end);
 
+      let output: string;
       if (showNums) {
         const maxWidth = String(end).length;
-        return selected
+        output = selected
           .map((line, i) => {
             const num = String(start + i).padStart(maxWidth, " ");
             return `${num}│ ${line}`;
           })
           .join("\n");
+      } else {
+        output = selected.join("\n");
       }
 
-      return selected.join("\n");
+      // Cap output to prevent token bloat in conversation history
+      const MAX_CHARS = 12_000;
+      if (output.length > MAX_CHARS) {
+        const totalLines = selected.length;
+        output = output.slice(0, MAX_CHARS) +
+          `\n\n... (truncated — showing ~${MAX_CHARS} chars of ${totalLines} lines. Use start_line/end_line to read specific sections)`;
+      }
+
+      return output;
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       return `Error reading file: ${msg}`;

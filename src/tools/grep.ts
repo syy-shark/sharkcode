@@ -98,6 +98,15 @@ export const grepTool = tool({
         ? `Found ${maxResults}+ matches (showing first ${maxResults}):\n`
         : `Found ${results.length} match(es):\n`;
 
-    return header + results.join("\n");
+    let output = header + results.join("\n");
+
+    // Cap output to prevent token bloat
+    const MAX_CHARS = 8_000;
+    if (output.length > MAX_CHARS) {
+      output = output.slice(0, MAX_CHARS) +
+        `\n\n... (output truncated at ${MAX_CHARS} chars)`;
+    }
+
+    return output;
   },
 });

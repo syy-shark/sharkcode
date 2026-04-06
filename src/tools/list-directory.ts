@@ -101,6 +101,15 @@ export const listDirectoryTool = tool({
       return "(empty directory)";
     }
 
-    return lines.join("\n") + `\n\n${fileCount.n} items listed`;
+    let output = lines.join("\n") + `\n\n${fileCount.n} items listed`;
+
+    // Cap output to prevent token bloat
+    const MAX_CHARS = 8_000;
+    if (output.length > MAX_CHARS) {
+      output = output.slice(0, MAX_CHARS) +
+        `\n\n... (output truncated at ${MAX_CHARS} chars. Use depth parameter to limit scope)`;
+    }
+
+    return output;
   },
 });
