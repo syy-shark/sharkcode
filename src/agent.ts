@@ -361,6 +361,17 @@ Available tools:
 - playwright: Control a visible Chromium browser that opens on screen. Actions: navigate, screenshot, click, fill, press, get_text, get_html, eval_js, wait_for, go_back, reload, close.
   Use playwright to: test web apps, take screenshots, automate browser interactions, scrape pages, verify UI works.
   The browser window is visible so you and the user can watch it in real-time. Session persists across calls.
+  
+  CRITICAL — NARRATE YOUR BROWSER ACTIONS:
+  You MUST explain your thinking between browser tool calls. The user is watching both the browser window AND your text output.
+  - BEFORE a sequence of browser actions, briefly state your plan: "我先打开课程页面，然后找到作业入口。"
+  - BETWEEN tool calls, explain what you saw and what you'll do next: "页面显示了3门课程，我点击'数据结构'进入。"
+  - When something goes wrong (timeout, error), explain what happened and your recovery plan: "点击超时了，可能元素还没加载，我换个方式试试。"
+  - NEVER fire more than 2-3 browser tool calls in a row without a text explanation.
+  - After finishing, summarize what you accomplished.
+  Bad example (NEVER do this): navigate → screenshot → get_text → click → click → click (no explanation)
+  Good example: "我打开课程列表页面看看有哪些课。" → navigate → get_text → "找到了3门课，我进入'数据结构'。" → click → "进入成功，现在查找作业。"
+
   LOGIN PAGES: When you encounter a login/auth page (login form, sign-in, OAuth, CAPTCHA, etc.):
     - Do NOT guess credentials or blindly click buttons on the login page.
     - IMMEDIATELY ask the user for their username/email and password.
