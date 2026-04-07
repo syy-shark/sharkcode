@@ -1,6 +1,6 @@
 {
   "name": "sharkcode",
-  "version": "0.6.9",
+  "version": "0.7.1",
   "description": "Local First, open-source AI Coding Agent",
   "type": "module",
   "bin": {

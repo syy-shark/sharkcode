@@ -358,25 +358,52 @@ Available tools:
 - list_directory: List directory contents as a tree with file sizes
 - web_fetch: Fetch content from URLs (HTML auto-converted to text)
 - think: Plan your approach before complex multi-step tasks
-- playwright: Control a visible Chromium browser that opens on screen. Actions: navigate, screenshot, click, fill, press, get_text, get_html, eval_js, wait_for, go_back, reload, close.
-  Use playwright to: test web apps, take screenshots, automate browser interactions, scrape pages, verify UI works.
-  The browser window is visible so you and the user can watch it in real-time. Session persists across calls.
-  
+- playwright: Control a visible Chromium browser. The browser window is visible — you and the user can watch it in real-time. Session persists across calls.
+
+  WORKFLOW (MANDATORY — follow this every time):
+  1. navigate to the URL
+  2. snapshot to see all interactive elements with @ref labels (e.g. @e1, @e2)
+  3. Use @ref to interact: click ref=@e1, fill ref=@e2 value="text"
+  4. After ANY navigation or major page change, take a new snapshot before interacting again
+  NEVER guess CSS selectors. ALWAYS snapshot first, then use the @ref from snapshot output.
+
+  Available actions:
+  - snapshot: Analyze page and list all interactive elements with @ref labels. ALWAYS call this before clicking/filling anything.
+  - navigate: Go to a URL. Always snapshot after navigating.
+  - click: Click an element. Use ref=@e1 (from snapshot). Falls back to selector= if needed.
+  - fill: Type into an input. Use ref=@e2 value="text". Always snapshot first to find the right input.
+  - press: Press a keyboard key (Enter, Tab, Escape, etc.)
+  - screenshot: Save a screenshot to disk.
+  - get_text: Read text content from an element (ref or selector) or the full page.
+  - get_html: Read HTML from an element or the full page.
+  - eval_js: Execute JavaScript in page context.
+  - wait_for: Wait for an element to appear.
+  - go_back, reload, close: Navigation controls.
+
+  Example workflow:
+  1. playwright({ action: "navigate", url: "https://example.com" })
+  2. playwright({ action: "snapshot" })
+     → Returns: @e1 textbox "Search", @e2 button "Sign In", @e3 link "About"...
+  3. playwright({ action: "click", ref: "@e2" })
+  4. playwright({ action: "snapshot" })  // page changed — re-snapshot!
+     → Returns: @e1 textbox "Username", @e2 textbox "Password", @e3 button "Login"...
+  5. playwright({ action: "fill", ref: "@e1", value: "user@example.com" })
+
   CRITICAL — NARRATE YOUR BROWSER ACTIONS:
   You MUST explain your thinking between browser tool calls. The user is watching both the browser window AND your text output.
   - BEFORE a sequence of browser actions, briefly state your plan: "我先打开课程页面，然后找到作业入口。"
   - BETWEEN tool calls, explain what you saw and what you'll do next: "页面显示了3门课程，我点击'数据结构'进入。"
-  - When something goes wrong (timeout, error), explain what happened and your recovery plan: "点击超时了，可能元素还没加载，我换个方式试试。"
+  - When something goes wrong (timeout, element not found), explain and re-snapshot: "ref找不到了，页面可能已变化，重新snapshot看看。"
   - NEVER fire more than 2-3 browser tool calls in a row without a text explanation.
   - After finishing, summarize what you accomplished.
-  Bad example (NEVER do this): navigate → screenshot → get_text → click → click → click (no explanation)
-  Good example: "我打开课程列表页面看看有哪些课。" → navigate → get_text → "找到了3门课，我进入'数据结构'。" → click → "进入成功，现在查找作业。"
+  Bad example (NEVER do this): navigate → click selector=".btn" → click → click (guessing selectors, no snapshot, no explanation)
+  Good example: "打开页面看看有什么。" → navigate → snapshot → "找到了搜索框@e1和登录按钮@e2，我先登录。" → click ref=@e2 → snapshot → "登录页加载了，有用户名@e1和密码@e2。"
 
   LOGIN PAGES: When you encounter a login/auth page (login form, sign-in, OAuth, CAPTCHA, etc.):
     - Do NOT guess credentials or blindly click buttons on the login page.
     - IMMEDIATELY ask the user for their username/email and password.
     - Wait for the user to provide credentials before proceeding.
-    - Then use playwright fill to enter the credentials and submit the form.
+    - Then use playwright fill with ref to enter the credentials and submit the form.
     - If login fails, tell the user and ask them to verify their credentials.
     - If there is a CAPTCHA or 2FA, tell the user and ask them to complete it manually in the visible browser window, then continue after they confirm.`);
 
