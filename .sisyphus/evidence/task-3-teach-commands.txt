@@ -1,0 +1,33 @@
+Task 3: /teach command family
+
+Changed files:
+- src/cli.ts
+- src/teach-command.test.ts
+
+Verification:
+
+1) lsp_diagnostics (error severity)
+- src/cli.ts: clean
+- src/teach-command.test.ts: clean
+
+2) bun run build
+$ bun run build
+$ tsup
+CLI Building entry: src/cli.ts
+CLI Using tsconfig: tsconfig.json
+CLI tsup v8.5.1
+CLI Using tsup config: C:\Users\syy11\Desktop\桌面\项目\SharkCode\tsup.config.ts
+CLI Target: node18
+CLI Cleaning output folder
+ESM Build start
+ESM dist\cli.mjs 181.27 KB
+ESM ⚡️ Build success in 22ms
+
+3) bun test src/teach-command.test.ts
+$ bun test src/teach-command.test.ts
+bun test v1.3.10 (30e609e0)
+
+10 pass
+0 fail
+16 expect() calls
+Ran 10 tests across 1 file. [569.00ms]
