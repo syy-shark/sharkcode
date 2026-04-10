@@ -1,12 +1,17 @@
-import { stepCountIs, streamText, type ModelMessage } from "ai";
+import { generateText, stepCountIs, streamText, type ModelMessage } from "ai";
 import chalk from "chalk";
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
 import { execSync } from "child_process";
 import { tools } from "./tools/index.ts";
-import { createProvider } from "./provider.ts";
-import type { Config } from "./config.ts";
+import { createProvider, createProviderAsync, getProviderExecutionMode } from "./provider.ts";
+import { normalizeProviderModel, type Config } from "./config.ts";
+import { getMaxOutputTokens, getStreamProviderOptions } from "./provider-call-options.ts";
+import type { CopilotTransport } from "./copilot-models.ts";
+import { getCopilotRuntime } from "./copilot-models.ts";
+import { getCodexAuth } from "./codex-auth.ts";
 import { registerToolSpinner, unregisterToolSpinner } from "./spinnerState.ts";
+import { normalizeGenerateResult, normalizeStreamEvent } from "./agent-events.ts";
 
 const PURPLE = chalk.hex("#a855f7");
 
@@ -292,10 +297,10 @@ function readProjectInstructions(): string | null {
 function getGitContext(): string | null {
   try {
     const branch = execSync("git branch --show-current", {
-      encoding: "utf-8", timeout: 3000, cwd: process.cwd(),
+      encoding: "utf-8", timeout: 3000, cwd: process.cwd(), stdio: ["ignore", "pipe", "ignore"],
     }).trim();
     const status = execSync("git status --porcelain", {
-      encoding: "utf-8", timeout: 3000, cwd: process.cwd(),
+      encoding: "utf-8", timeout: 3000, cwd: process.cwd(), stdio: ["ignore", "pipe", "ignore"],
     }).trim();
 
     let ctx = `Git branch: ${branch}`;
@@ -471,6 +476,16 @@ Exploration:
 - Explore before making changes to code you haven't seen.
 - Use think tool to plan multi-step changes before starting.`);
 
+  // Image understanding
+  parts.push(`
+Image understanding:
+- Users can include image file paths in their messages (e.g. "分析这张图 C:\\screenshots\\bug.png").
+- Image files (.png, .jpg, .jpeg, .gif, .webp, .bmp, .svg) are automatically loaded and sent to you as image content.
+- When you receive images, analyze them carefully and respond based on what you see.
+- For screenshots of errors, identify the error and suggest fixes.
+- For UI screenshots, describe what you see and suggest improvements if asked.
+- For diagrams/architecture images, interpret and explain the structure.`);
+
   return parts.join("\n");
 }
 
@@ -530,22 +545,237 @@ export interface RunAgentResult {
   partialText: string;
 }
 
+function summarizeToolOutput(output: unknown): string {
+  if (typeof output === "string") {
+    return truncate(output, 80);
+  }
+
+  try {
+    return truncate(JSON.stringify(output), 80);
+  } catch {
+    return truncate(String(output), 80);
+  }
+}
+
+function renderGeneratedSteps(
+  steps: Array<{ content: Array<Record<string, unknown>> }>,
+): string {
+  let printedText = "";
+
+  for (const step of steps) {
+    for (const part of step.content) {
+      if (part.type === "tool-call") {
+        const toolName = typeof part.toolName === "string" ? part.toolName : "";
+        const meta = TOOL_LABELS[toolName] ?? { icon: "🔧", verb: "running" };
+        const argHint = getArgHint(toolName, part.input);
+        const cols = Math.min(process.stdout.columns ?? 80, 60);
+
+        process.stdout.write(`  ${chalk.hex("#4c1d95")("─".repeat(cols - 4))}\n`);
+        process.stdout.write(
+          `  ${meta.icon} ${PURPLE(meta.verb)}${argHint ? chalk.dim(" › ") + chalk.white(argHint) : ""}\n`
+        );
+      }
+
+      if (part.type === "tool-result") {
+        process.stdout.write(
+          `  ${chalk.green("✓")} ${chalk.dim(summarizeToolOutput(part.output))}\n`
+        );
+      }
+
+      if (part.type === "text" && typeof part.text === "string" && part.text.length > 0) {
+        process.stdout.write(part.text);
+        printedText += part.text;
+      }
+    }
+  }
+
+  if (printedText && !printedText.endsWith("\n")) {
+    process.stdout.write("\n");
+  }
+
+  return printedText;
+}
+
+function getNormalizedGeneratedSteps(
+  steps: Array<{ content: Array<Record<string, unknown>> }>,
+): Array<{
+  text?: string;
+  toolCalls?: Array<{ toolName: string; args: unknown }>;
+  toolResults?: Array<{ toolName: string; result: unknown }>;
+}> {
+  return steps.map((step) => {
+    let text = "";
+    const toolCalls: Array<{ toolName: string; args: unknown }> = [];
+    const toolResults: Array<{ toolName: string; result: unknown }> = [];
+
+    for (const part of step.content) {
+      if (part.type === "text" && typeof part.text === "string" && part.text.length > 0) {
+        text += part.text;
+      }
+
+      if (part.type === "tool-call" && typeof part.toolName === "string") {
+        toolCalls.push({ toolName: part.toolName, args: part.input });
+      }
+
+      if (part.type === "tool-result" && typeof part.toolName === "string") {
+        toolResults.push({ toolName: part.toolName, result: part.output });
+      }
+    }
+
+    return {
+      text: text || undefined,
+      toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+      toolResults: toolResults.length > 0 ? toolResults : undefined,
+    };
+  });
+}
+
+function getNormalizedStreamEvent(rawEvent: unknown) {
+  if (
+    typeof rawEvent === "object" &&
+    rawEvent !== null &&
+    "type" in rawEvent &&
+    rawEvent.type === "tool-call" &&
+    "input" in rawEvent
+  ) {
+    return normalizeStreamEvent({ ...rawEvent, args: rawEvent.input });
+  }
+
+  if (
+    typeof rawEvent === "object" &&
+    rawEvent !== null &&
+    "type" in rawEvent &&
+    rawEvent.type === "tool-result" &&
+    "output" in rawEvent
+  ) {
+    return normalizeStreamEvent({ ...rawEvent, result: rawEvent.output });
+  }
+
+  return normalizeStreamEvent(rawEvent);
+}
+
 export async function runAgent(
   messages: ModelMessage[],
   config: Config,
   abortSignal?: AbortSignal,
+  eventBus?: import("./agent-events.ts").AgentEventBus,
 ): Promise<RunAgentResult> {
-  const model = createProvider(config);
+  let useCodexSubscriptionInstructions = false;
+  let copilotTransport: CopilotTransport = "chat";
+  if (config.providerName === "codex" && !config.apiKey) {
+    try {
+      await getCodexAuth();
+      useCodexSubscriptionInstructions = true;
+    } catch {
+      useCodexSubscriptionInstructions = false;
+    }
+  }
+  if (config.providerName === "copilot") {
+    const runtime = await getCopilotRuntime(
+      normalizeProviderModel(config.providerName, config.model),
+    );
+    copilotTransport = runtime.transport;
+  }
+
+  const executionMode = (config.providerName === "copilot")
+    ? await getProviderExecutionMode(config)
+    : "stream";
+
+  const model = (config.providerName === "copilot" || config.providerName === "codex")
+    ? await createProviderAsync(config)
+    : createProvider(config);
 
   const compacted = compactMessages(messages);
+  const systemPrompt = buildSystemPrompt();
+
+  if (executionMode === "generate") {
+    const thinkingSpinner = createSpinner("thinking...");
+    thinkingSpinner.start();
+
+    try {
+      const result = await generateText({
+        model,
+        system: useCodexSubscriptionInstructions ? undefined : systemPrompt,
+        messages: compacted,
+        providerOptions: getStreamProviderOptions(
+          config,
+          useCodexSubscriptionInstructions ? systemPrompt : undefined,
+          copilotTransport,
+        ),
+        tools,
+        maxRetries: 2,
+        maxOutputTokens: getMaxOutputTokens(config),
+        stopWhen: stepCountIs(50),
+        abortSignal,
+      });
+
+      thinkingSpinner.stop();
+
+      const renderableSteps = result.steps as Array<{ content: Array<Record<string, unknown>> }>;
+      const generatedText = renderGeneratedSteps(renderableSteps);
+
+      if (eventBus) {
+        const events = normalizeGenerateResult({
+          text: result.text,
+          steps: getNormalizedGeneratedSteps(renderableSteps),
+        });
+        for (const event of events) {
+          eventBus.emit(event);
+        }
+      }
+
+      const finishReason = result.steps.at(-1)?.finishReason;
+      if (finishReason === "length") {
+        process.stderr.write(
+          chalk.yellow("\n  ⚠ 输出因 token 限制被截断。") +
+          chalk.gray(" 大文件可能未完整写入，请检查并重试（可尝试分段生成）。\n")
+        );
+      } else if (finishReason === "content-filter") {
+        process.stderr.write(
+          chalk.yellow("\n  ⚠ 输出被内容过滤器截断。\n")
+        );
+      }
+
+      const usage = await result.totalUsage;
+      if (usage) {
+        process.stderr.write(
+          chalk.dim(`  📊 ${usage.inputTokens}↑ ${usage.outputTokens}↓  steps:${result.steps.length}\n`)
+        );
+      }
+
+      const response = await result.response;
+      return {
+        messages: [...messages, ...response.messages] as ModelMessage[],
+        interrupted: false,
+        partialText: generatedText || result.text,
+      };
+    } catch (err: unknown) {
+      thinkingSpinner.stop();
+
+      if (
+        err instanceof Error &&
+        (err.name === "AbortError" || err.message.includes("abort"))
+      ) {
+        process.stdout.write(chalk.yellow("\n  ⏹ 已中断\n"));
+        return { messages, interrupted: true, partialText: "" };
+      }
+
+      throw err;
+    }
+  }
 
   const result = streamText({
     model,
-    system: buildSystemPrompt(),
+    system: useCodexSubscriptionInstructions ? undefined : systemPrompt,
     messages: compacted,
+    providerOptions: getStreamProviderOptions(
+      config,
+      useCodexSubscriptionInstructions ? systemPrompt : undefined,
+      copilotTransport,
+    ),
     tools,
     maxRetries: 2,
-    maxOutputTokens: 16384,
+    maxOutputTokens: getMaxOutputTokens(config),
     stopWhen: stepCountIs(50),
     abortSignal,
   });
@@ -591,6 +821,7 @@ export async function runAgent(
   let currentToolName = "";
 
   thinkingSpinner.start();
+  if (eventBus) eventBus.emit({ type: "run-start" });
 
   try {
     for await (const event of result.fullStream) {
@@ -607,181 +838,186 @@ export async function runAgent(
         thinkingDone = true;
       }
 
-    switch (event.type) {
-      case "text-delta":
-        // Collapse excess blank lines between a tool result and next paragraph
-        if (trailingNL > 1 && event.text.trim() !== "") collapseNL(1);
-        // Prevent accumulating multiple blank lines — collapse immediately
-        if (trailingNL >= 2) collapseNL(1);
-        // Hide cursor before writing, then re-show for live effect
-        streamCursor.hide();
-        writeOut(event.text);
-        partialText += event.text;
-        if (!isStreaming) isStreaming = true;
-        streamCursor.show();
-        break;
+      switch (event.type) {
+        case "text-delta":
+          // Collapse excess blank lines between a tool result and next paragraph
+          if (trailingNL > 1 && event.text.trim() !== "") collapseNL(1);
+          // Prevent accumulating multiple blank lines — collapse immediately
+          if (trailingNL >= 2) collapseNL(1);
+          // Hide cursor before writing, then re-show for live effect
+          streamCursor.hide();
+          writeOut(event.text);
+          partialText += event.text;
+          if (!isStreaming) isStreaming = true;
+          streamCursor.show();
+          break;
 
-      case "tool-call": {
-        // Hide streaming cursor when transitioning to tool execution
-        streamCursor.hide();
-        isStreaming = false;
+        case "tool-call": {
+          // Hide streaming cursor when transitioning to tool execution
+          streamCursor.hide();
+          isStreaming = false;
 
-        // Stop composing spinner if still running
-        if (composingSpinner) {
-          composingSpinner.stop();
-          composingSpinner = null;
+          // Stop composing spinner if still running
+          if (composingSpinner) {
+            composingSpinner.stop();
+            composingSpinner = null;
+            composingToolName = "";
+            composingBytes = 0;
+          }
+
+          const meta = TOOL_LABELS[event.toolName] ?? { icon: "🔧", verb: "running" };
+          currentToolName = event.toolName;
+
+          const argHint = getArgHint(event.toolName, event.input);
+
+          // Collapse ALL trailing blank lines — keep zero so tool header is tight
+          collapseNL(0);
+          if (trailingNL === 0) writeOut("\n");
+
+          // Thin separator + compact tool header on ONE line
+          const cols = Math.min(process.stdout.columns ?? 80, 60);
+          process.stdout.write(`  ${chalk.hex("#4c1d95")("─".repeat(cols - 4))}\n`);
+          process.stdout.write(
+            `  ${meta.icon} ${PURPLE(meta.verb)}${argHint ? chalk.dim(" › ") + chalk.white(argHint) : ""}\n`
+          );
+
+          // Spinner starts immediately on next line
+          toolSpinner = createSpinner(`${meta.verb}...`);
+          registerToolSpinner(() => toolSpinner?.stop());
+          toolSpinner.start();
+
+          trailingNL = 0;
+          break;
+        }
+
+        case "tool-result": {
+          if (toolSpinner) {
+            toolSpinner.stop();
+            toolSpinner = null;
+            unregisterToolSpinner();
+          }
+          const summary = truncate(String(event.output), 80);
+          // Single compact result line
+          process.stdout.write(
+            `  ${chalk.green("✓")} ${chalk.dim(summary)}\n`
+          );
+          trailingNL = 1;
+          break;
+        }
+
+        case "tool-error":
+          if (toolSpinner) {
+            toolSpinner.stop();
+            toolSpinner = null;
+            unregisterToolSpinner();
+          }
+          process.stderr.write(
+            chalk.red(`  ✗ [${event.toolName}] ${String(event.error)}\n`)
+          );
+          trailingNL = 1;
+          break;
+
+        // ── Tool-input streaming (bridges the "frozen" gap during large arg generation) ──
+        case "tool-input-start": {
+          // Model just started generating tool arguments — show a composing spinner
+          streamCursor.hide();
+          isStreaming = false;
+
+          // Collapse ALL trailing blank lines so spinner appears tight below content
+          collapseNL(0);
+          if (trailingNL === 0) writeOut("\n");
+
+          composingToolName = event.toolName;
+          composingBytes = 0;
+
+          const meta = TOOL_LABELS[event.toolName] ?? { icon: "🔧", verb: "running" };
+          const label = `composing ${meta.verb} input...`;
+          composingSpinner = createSpinner(label);
+          composingSpinner.start();
+          break;
+        }
+
+        case "tool-input-delta": {
+          // Model is still generating tool arguments — keep spinner alive,
+          // update byte counter so user sees continuous progress
+          composingBytes += event.delta.length;
+          if (composingSpinner && composingBytes > 500) {
+            // Update the spinner label with byte count, but only every ~2KB to avoid thrash
+            const kb = (composingBytes / 1024).toFixed(1);
+            const kbRounded = Math.floor(composingBytes / 2048);
+            const prevKbRounded = Math.floor((composingBytes - event.delta.length) / 2048);
+            if (kbRounded !== prevKbRounded || composingBytes - event.delta.length <= 500) {
+              const meta = TOOL_LABELS[composingToolName] ?? { icon: "🔧", verb: "running" };
+              composingSpinner.stop();
+              composingSpinner = createSpinner(`composing ${meta.verb} input... ${kb}KB`);
+              composingSpinner.start();
+            }
+          }
+          break;
+        }
+
+        case "tool-input-end": {
+          // Tool argument generation complete — clean up composing spinner
+          // (tool-call event will follow immediately and start its own animation)
+          if (composingSpinner) {
+            composingSpinner.stop();
+            composingSpinner = null;
+          }
           composingToolName = "";
           composingBytes = 0;
+          break;
         }
 
-        const meta = TOOL_LABELS[event.toolName] ?? { icon: "🔧", verb: "running" };
-        currentToolName = event.toolName;
-
-        const argHint = getArgHint(event.toolName, event.input);
-
-        // Collapse ALL trailing blank lines — keep zero so tool header is tight
-        collapseNL(0);
-        if (trailingNL === 0) writeOut("\n");
-
-        // Thin separator + compact tool header on ONE line
-        const cols = Math.min(process.stdout.columns ?? 80, 60);
-        process.stdout.write(`  ${chalk.hex("#4c1d95")("─".repeat(cols - 4))}\n`);
-        process.stdout.write(
-          `  ${meta.icon} ${PURPLE(meta.verb)}${argHint ? chalk.dim(" › ") + chalk.white(argHint) : ""}\n`
-        );
-
-        // Spinner starts immediately on next line
-        toolSpinner = createSpinner(`${meta.verb}...`);
-        registerToolSpinner(() => toolSpinner?.stop());
-        toolSpinner.start();
-
-        trailingNL = 0;
-        break;
-      }
-
-      case "tool-result": {
-        if (toolSpinner) {
-          toolSpinner.stop();
-          toolSpinner = null;
-          unregisterToolSpinner();
-        }
-        const summary = truncate(String(event.output), 80);
-        // Single compact result line
-        process.stdout.write(
-          `  ${chalk.green("✓")} ${chalk.dim(summary)}\n`
-        );
-        trailingNL = 1;
-        break;
-      }
-
-      case "tool-error":
-        if (toolSpinner) {
-          toolSpinner.stop();
-          toolSpinner = null;
-          unregisterToolSpinner();
-        }
-        process.stderr.write(
-          chalk.red(`  ✗ [${event.toolName}] ${String(event.error)}\n`)
-        );
-        trailingNL = 1;
-        break;
-
-      // ── Tool-input streaming (bridges the "frozen" gap during large arg generation) ──
-      case "tool-input-start": {
-        // Model just started generating tool arguments — show a composing spinner
-        streamCursor.hide();
-        isStreaming = false;
-
-        // Collapse ALL trailing blank lines so spinner appears tight below content
-        collapseNL(0);
-        if (trailingNL === 0) writeOut("\n");
-
-        composingToolName = event.toolName;
-        composingBytes = 0;
-
-        const meta = TOOL_LABELS[event.toolName] ?? { icon: "🔧", verb: "running" };
-        const label = `composing ${meta.verb} input...`;
-        composingSpinner = createSpinner(label);
-        composingSpinner.start();
-        break;
-      }
-
-      case "tool-input-delta": {
-        // Model is still generating tool arguments — keep spinner alive,
-        // update byte counter so user sees continuous progress
-        composingBytes += event.delta.length;
-        if (composingSpinner && composingBytes > 500) {
-          // Update the spinner label with byte count, but only every ~2KB to avoid thrash
-          const kb = (composingBytes / 1024).toFixed(1);
-          const kbRounded = Math.floor(composingBytes / 2048);
-          const prevKbRounded = Math.floor((composingBytes - event.delta.length) / 2048);
-          if (kbRounded !== prevKbRounded || composingBytes - event.delta.length <= 500) {
-            const meta = TOOL_LABELS[composingToolName] ?? { icon: "🔧", verb: "running" };
-            composingSpinner.stop();
-            composingSpinner = createSpinner(`composing ${meta.verb} input... ${kb}KB`);
-            composingSpinner.start();
+        // ── Reasoning/thinking events (for models like DeepSeek R1, o1) ──
+        case "reasoning-start": {
+          // Model entered reasoning mode — show a thinking indicator
+          if (!thinkingDone) {
+            // Already have thinkingSpinner running
+          } else {
+            // Restart thinking spinner for multi-step reasoning
+            streamCursor.hide();
+            thinkingSpinner.start();
           }
+          break;
         }
-        break;
-      }
 
-      case "tool-input-end": {
-        // Tool argument generation complete — clean up composing spinner
-        // (tool-call event will follow immediately and start its own animation)
-        if (composingSpinner) {
-          composingSpinner.stop();
-          composingSpinner = null;
+        case "reasoning-delta": {
+          // Could optionally display reasoning text; for now just keep spinner alive
+          break;
         }
-        composingToolName = "";
-        composingBytes = 0;
-        break;
-      }
 
-      // ── Reasoning/thinking events (for models like DeepSeek R1, o1) ──
-      case "reasoning-start": {
-        // Model entered reasoning mode — show a thinking indicator
-        if (!thinkingDone) {
-          // Already have thinkingSpinner running
-        } else {
-          // Restart thinking spinner for multi-step reasoning
+        case "reasoning-end": {
+          thinkingSpinner.stop();
+          break;
+        }
+
+        // ── Step lifecycle ──
+        case "start-step": {
+          // New step — no separator; the tool header line is enough visual break
+          break;
+        }
+
+        case "finish-step":
           streamCursor.hide();
-          thinkingSpinner.start();
-        }
-        break;
+          isStreaming = false;
+          currentStep++;
+          break;
+
+        case "error":
+          streamCursor.hide();
+          if (composingSpinner) { composingSpinner.stop(); composingSpinner = null; }
+          if (toolSpinner) { toolSpinner.stop(); toolSpinner = null; unregisterToolSpinner(); }
+          thinkingSpinner.stop();
+          process.stderr.write(chalk.red(`\n❌ ${String(event.error)}\n`));
+          trailingNL = 1;
+          break;
       }
 
-      case "reasoning-delta": {
-        // Could optionally display reasoning text; for now just keep spinner alive
-        break;
+      if (eventBus) {
+        const normalized = getNormalizedStreamEvent(event);
+        if (normalized) eventBus.emit(normalized);
       }
-
-      case "reasoning-end": {
-        thinkingSpinner.stop();
-        break;
-      }
-
-      // ── Step lifecycle ──
-      case "start-step": {
-        // New step — no separator; the tool header line is enough visual break
-        break;
-      }
-
-      case "finish-step":
-        streamCursor.hide();
-        isStreaming = false;
-        currentStep++;
-        break;
-
-      case "error":
-        streamCursor.hide();
-        if (composingSpinner) { composingSpinner.stop(); composingSpinner = null; }
-        if (toolSpinner) { toolSpinner.stop(); toolSpinner = null; unregisterToolSpinner(); }
-        thinkingSpinner.stop();
-        process.stderr.write(chalk.red(`\n❌ ${String(event.error)}\n`));
-        trailingNL = 1;
-        break;
     }
-  }
   } catch (err: unknown) {
     // Handle abort (user pressed Escape)
     if (
@@ -800,6 +1036,8 @@ export async function runAgent(
   streamCursor.hide();
   if (composingSpinner) { composingSpinner.stop(); composingSpinner = null; }
   if (toolSpinner) { toolSpinner.stop(); unregisterToolSpinner(); }
+
+  if (eventBus) eventBus.emit({ type: "run-end", interrupted });
 
   if (interrupted) {
     // Show interruption indicator

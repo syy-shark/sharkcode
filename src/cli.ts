@@ -27,6 +27,11 @@ import { checkForAvailableUpdate, getUpdateCommand, runGlobalUpdate, type Availa
 import { loginWithDeviceFlow, isCopilotLoggedIn, clearCopilotAuth } from "./copilot-auth.ts";
 import { getCopilotPresetModels } from "./copilot-models.ts";
 import { loginWithCodexDeviceFlow, isCodexLoggedIn, clearCodexAuth } from "./codex-auth.ts";
+import { createProvider } from "./provider.ts";
+import { AgentEventBus } from "./agent-events.ts";
+import { TeachingOrchestrator } from "./teaching.ts";
+import { canUseEducationalMode, printFallbackNotice } from "./teaching-fallback.ts";
+import { startEducationalApp } from "./ui/EducationalApp.tsx";
 import type { ModelMessage } from "ai";
 
 // ─── Colors ───────────────────────────────────────────────────────────────────
@@ -1453,8 +1458,64 @@ ${PURPLE("  项目配置：")}
     };
     process.stdin.on("data", interruptListener);
 
+    const teachingEnabled = multiConfig.teaching.enabled;
+    const fallbackCheck = canUseEducationalMode({
+      teachingEnabled,
+      isTTY: process.stdout.isTTY,
+      terminalWidth: process.stdout.columns,
+    });
+
+    let educationalApp: { unmount: () => void } | null = null;
+    let eventBus: AgentEventBus | undefined;
+
+    if (fallbackCheck.canUse) {
+      const teachingModel = multiConfig.teaching.model ?? config.model;
+      const teachingConfig = { ...config, model: teachingModel };
+
+      eventBus = new AgentEventBus();
+      const teachingOrchestrator = new TeachingOrchestrator({
+        model: teachingModel,
+        verbosity: multiConfig.teaching.verbosity,
+        getProvider: () => createProvider(teachingConfig),
+      });
+
+      const toolCalls: Array<{ toolName: string; args: unknown }> = [];
+      const toolResults: Array<{ toolName: string; result: string }> = [];
+      let agentTextSummary = "";
+
+      const unsubscribeContext = eventBus.subscribe((event) => {
+        if (event.type === "tool-call") {
+          toolCalls.push({ toolName: event.toolName, args: event.args });
+        }
+        if (event.type === "tool-result") {
+          toolResults.push({ toolName: event.toolName, result: event.result });
+        }
+        if (event.type === "text-delta") {
+          agentTextSummary += event.delta;
+        }
+        if (event.type === "run-end") {
+          unsubscribeContext();
+          void teachingOrchestrator.teach({
+            userPrompt: trimmed,
+            toolCalls,
+            toolResults,
+            agentTextSummary: agentTextSummary.slice(0, 500),
+          }, abortSignal);
+        }
+      });
+
+      educationalApp = startEducationalApp(eventBus, teachingOrchestrator, {
+        onExit: () => {
+          educationalApp?.unmount();
+          educationalApp = null;
+        },
+      });
+    } else if (teachingEnabled && fallbackCheck.reason) {
+      printFallbackNotice(fallbackCheck.reason);
+    }
+
     try {
-      const result = await runAgent(messages, config, abortSignal);
+      const result = await runAgent(messages, config, abortSignal, eventBus);
       messages = result.messages;
 
       if (result.interrupted) {
@@ -1469,6 +1530,10 @@ ${PURPLE("  项目配置：")}
       // Always clean up: remove interrupt listener, reset state, restore raw mode
       process.stdin.removeListener("data", interruptListener);
       resetInterrupt();
+      if (educationalApp) {
+        educationalApp.unmount();
+        educationalApp = null;
+      }
       try { process.stdin.setRawMode(true); process.stdin.resume(); } catch {}
     }
   }
