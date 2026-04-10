@@ -22,6 +22,7 @@
   "devDependencies": {
     "@types/bun": "latest",
     "@types/node": "^24.6.0",
+    "@types/react": "^19.2.14",
     "tsup": "^8.5.0",
     "typescript": "^5.9.3"
   },
@@ -30,7 +31,9 @@
     "@inquirer/prompts": "^8.3.2",
     "ai": "^6.0.141",
     "chalk": "^5.6.2",
+    "ink": "^7.0.0",
     "playwright": "^1.49.0",
+    "react": "^19.2.5",
     "smol-toml": "^1.6.1",
     "zod": "^4.3.6"
   },
