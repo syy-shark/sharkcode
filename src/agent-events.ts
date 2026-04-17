@@ -14,10 +14,12 @@ type AgentEventListener = (event: AgentEvent) => void;
 
 type GenerateResultToolCall = { toolName: string; args: unknown };
 type GenerateResultToolResult = { toolName: string; result: unknown };
+type GenerateResultToolError = { toolName: string; error: unknown };
 type GenerateResultStep = {
   text?: string;
   toolCalls?: Array<GenerateResultToolCall>;
   toolResults?: Array<GenerateResultToolResult>;
+  toolErrors?: Array<GenerateResultToolError>;
 };
 
 export class AgentEventBus {
@@ -67,7 +69,8 @@ function getTextDelta(value: Record<string, unknown>): string | null {
 function hasStepContent(step: GenerateResultStep): boolean {
   return (step.text !== undefined && step.text !== "") ||
     (step.toolCalls?.length ?? 0) > 0 ||
-    (step.toolResults?.length ?? 0) > 0;
+    (step.toolResults?.length ?? 0) > 0 ||
+    (step.toolErrors?.length ?? 0) > 0;
 }
 
 export function normalizeStreamEvent(rawEvent: unknown): AgentEvent | null {
@@ -104,6 +107,15 @@ export function normalizeStreamEvent(rawEvent: unknown): AgentEvent | null {
       return { type: "tool-result", toolName, result: String(rawEvent.result) };
     }
 
+    case "tool-error": {
+      const toolName = getString(rawEvent, "toolName");
+      if (toolName === null || !hasOwn(rawEvent, "error")) {
+        return null;
+      }
+
+      return { type: "tool-error", toolName, error: String(rawEvent.error) };
+    }
+
     case "reasoning":
     case "reasoning-delta": {
       const delta = getTextDelta(rawEvent);
@@ -135,16 +147,18 @@ export function normalizeGenerateResult(result: {
   text?: string;
   toolCalls?: Array<{ toolName: string; args: unknown }>;
   toolResults?: Array<{ toolName: string; result: unknown }>;
+  toolErrors?: Array<{ toolName: string; error: unknown }>;
   steps?: Array<{
     text?: string;
     toolCalls?: Array<{ toolName: string; args: unknown }>;
     toolResults?: Array<{ toolName: string; result: unknown }>;
+    toolErrors?: Array<{ toolName: string; error: unknown }>;
   }>;
 }): AgentEvent[] {
   const steps = result.steps && result.steps.length > 0
     ? result.steps
     : hasStepContent(result)
-    ? [{ text: result.text, toolCalls: result.toolCalls, toolResults: result.toolResults }]
+    ? [{ text: result.text, toolCalls: result.toolCalls, toolResults: result.toolResults, toolErrors: result.toolErrors }]
     : [];
 
   const events: AgentEvent[] = [{ type: "run-start" }];
@@ -169,6 +183,14 @@ export function normalizeGenerateResult(result: {
         type: "tool-result",
         toolName: toolResult.toolName,
         result: String(toolResult.result),
+      });
+    }
+
+    for (const toolError of step.toolErrors ?? []) {
+      events.push({
+        type: "tool-error",
+        toolName: toolError.toolName,
+        error: String(toolError.error),
       });
     }
 

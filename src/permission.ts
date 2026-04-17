@@ -11,6 +11,7 @@ const DIM    = chalk.dim;
 
 // ─── Permission mode (set by CLI, read by tools) ──────────────────────────────
 let _permissionMode: "prompt" | "full-access" = "prompt";
+let _suppressAutoApprovedOutput = false;
 
 export function setPermissionMode(mode: "prompt" | "full-access"): void {
   _permissionMode = mode;
@@ -20,17 +21,82 @@ export function getPermissionMode(): "prompt" | "full-access" {
   return _permissionMode;
 }
 
+export function setSuppressAutoApprovedOutput(suppress: boolean): void {
+  _suppressAutoApprovedOutput = suppress;
+}
+
+// ─── In-shell permission adapter ─────────────────────────────────────────────
+// When the educational shell is active, it can register itself as the permission handler
+// to render permission prompts inside the shell instead of using stderr
+
+export type PermissionDecision = "allow" | "deny" | "allow-all";
+
+export interface PermissionRequest {
+  command: string;
+  resolve: (decision: PermissionDecision) => void;
+}
+
+export type PermissionHandler = (request: PermissionRequest) => void;
+
+let _shellPermissionHandler: PermissionHandler | null = null;
+
+/**
+ * Register an in-shell permission handler.
+ * When registered, askPermission() will delegate to the shell instead of using stderr.
+ */
+export function registerShellPermissionHandler(handler: PermissionHandler): void {
+  _shellPermissionHandler = handler;
+}
+
+/**
+ * Unregister the in-shell permission handler.
+ * Should be called when the shell unmounts.
+ */
+export function unregisterShellPermissionHandler(): void {
+  _shellPermissionHandler = null;
+}
+
+/**
+ * Check if a shell permission handler is registered.
+ */
+export function hasShellPermissionHandler(): boolean {
+  return _shellPermissionHandler !== null;
+}
+
 // ─── Ask user to approve a shell command ──────────────────────────────────────
 export async function askPermission(command: string): Promise<boolean> {
   // Full-access mode: silently allow everything
   if (_permissionMode === "full-access") {
-    process.stdout.write(
-      PURPLE("  ◆ ") + DIM("auto-approved") + GRAY(" › ") + chalk.white(command) + "\n"
-    );
+    if (!_suppressAutoApprovedOutput) {
+      process.stdout.write(
+        PURPLE("  ◆ ") + DIM("auto-approved") + GRAY(" › ") + chalk.white(command) + "\n"
+      );
+    }
     return true;
   }
 
-  // ── Draw the permission box ───────────────────────────────────────────────
+  // If shell handler is registered, delegate to it
+  if (_shellPermissionHandler) {
+    return new Promise((resolve) => {
+      setAwaitingPermission(true);
+      _shellPermissionHandler!({
+        command,
+        resolve: (decision) => {
+          setAwaitingPermission(false);
+          if (decision === "allow") {
+            resolve(true);
+          } else if (decision === "allow-all") {
+            _permissionMode = "full-access";
+            resolve(true);
+          } else {
+            resolve(false);
+          }
+        },
+      });
+    });
+  }
+
+  // ── Fallback: Draw the permission box on stderr ────────────────────────────
   // Stop any active tool spinner first so it doesn't corrupt the box
   stopToolSpinner();
   const width = Math.min(72, process.stdout.columns ?? 80);

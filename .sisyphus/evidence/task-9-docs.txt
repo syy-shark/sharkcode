@@ -1,0 +1,28 @@
+Task 9 — Documentation Evidence
+================================
+Date: 2026-04-11
+
+## README.md changes
+
+1. Slash Commands table — added:
+   - /teach          (toggle educational mode, show status)
+   - /teach on       (enable)
+   - /teach off      (disable)
+   - /teach model    (set teaching model)
+   - /teach level    (set verbosity: 简洁/标准/详细)
+
+2. New section: "Educational Mode（教育模式）"
+   - Dual-pane ASCII diagram
+   - Activation instructions
+   - Teaching model config
+   - Verbosity config
+   - config.toml snippet
+   - Notes on REPL-only restriction, TTY fallback, best-effort teaching
+
+3. Configure section — config.toml example updated with [teaching] block:
+   enabled = false
+   verbosity = "标准"
+   model = ""
+
+## Files modified
+- README.md

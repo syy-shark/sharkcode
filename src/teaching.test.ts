@@ -43,6 +43,9 @@ const baseContext = {
   userPrompt: "帮我解释 agent 为什么运行这些工具",
   toolCalls: [{ toolName: "read_file", args: { filePath: "src/app.ts" } }],
   toolResults: [{ toolName: "read_file", result: "const answer = 42;" }],
+  toolErrors: [],
+  agentErrors: [],
+  interrupted: false,
   agentTextSummary: "Agent 正在读取文件并准备解释代码结构。",
 };
 
@@ -160,8 +163,50 @@ describe("TeachingOrchestrator", () => {
     await detailed.teach(baseContext);
 
     expect(streamCalls).toHaveLength(2);
-    expect(streamCalls[0]?.system).toContain("请简洁地解释，用2-3句话。");
-    expect(streamCalls[1]?.system).toContain("请详细解释每个步骤，包括为什么这样做。");
+    // 简洁 mode should mention "1-2 句" for brevity
+    expect(streamCalls[0]?.system).toContain("1-2 句");
+    // 详细 mode should mention "2-4 句" for more detail
+    expect(streamCalls[1]?.system).toContain("2-4 句");
+    // Both should prohibit fluffy praise
+    expect(streamCalls[0]?.system).toContain("不要空泛夸赞");
     expect(streamCalls[0]?.system).not.toBe(streamCalls[1]?.system);
+  });
+
+  it("requests explicit teaching sections and no fluffy praise", async () => {
+    const orchestrator = createOrchestrator();
+    await orchestrator.teach(baseContext);
+
+    expect(streamCalls).toHaveLength(1);
+    const systemPrompt = streamCalls[0]?.system ?? "";
+
+    // Must require the three fixed section markers
+    expect(systemPrompt).toContain("【Prompt 点评】");
+    expect(systemPrompt).toContain("【知识补给】");
+    expect(systemPrompt).toContain("【下次试试】");
+
+    // Must prohibit fluffy praise and marketing language
+    expect(systemPrompt).toContain("不要空泛夸赞");
+    expect(systemPrompt).toContain("不要写营销口号");
+    expect(systemPrompt).toContain("不要重复用户原话");
+    expect(systemPrompt).toContain("用户怎么提需求更好");
+  });
+
+  it("includes tool errors in the teaching prompt", async () => {
+    const orchestrator = createOrchestrator();
+
+    await orchestrator.teach({
+      ...baseContext,
+      toolErrors: [{ toolName: "playwright", error: "snapshot failed" }],
+      agentErrors: ["provider timeout"],
+      interrupted: true,
+    });
+
+    expect(streamCalls).toHaveLength(1);
+    expect(streamCalls[0]?.prompt).toContain("工具错误");
+    expect(streamCalls[0]?.prompt).toContain("playwright: snapshot failed");
+    expect(streamCalls[0]?.prompt).toContain("Agent 错误");
+    expect(streamCalls[0]?.prompt).toContain("provider timeout");
+    expect(streamCalls[0]?.prompt).toContain("本次执行被用户中断");
+    expect(streamCalls[0]?.prompt).toContain("不要评价设计风格");
   });
 });

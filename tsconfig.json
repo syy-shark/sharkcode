@@ -13,6 +13,7 @@
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
     "noEmit": true,
+    "types": ["node", "bun"],
 
     // Best practices
     "strict": true,

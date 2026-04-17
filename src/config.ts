@@ -46,23 +46,29 @@ export type ThinkingLevel =
 	| "medium"
 	| "high"
 	| "xhigh";
-export type TeachingVerbosity = "简洁" | "标准" | "详细";
+export type LearningVerbosity = "简洁" | "标准" | "详细";
+export type TeachingVerbosity = LearningVerbosity;
 
-export interface TeachingConfig {
+export interface LearningConfig {
 	enabled: boolean;
 	model?: string;
-	verbosity: TeachingVerbosity;
+	verbosity: LearningVerbosity;
+	autoCards: boolean;
+	background?: string;
 }
+
+export type TeachingConfig = LearningConfig;
 
 export interface SharkCodeConfig {
 	activeProvider: string;
 	providers: Record<string, ProviderEntry>;
 	permissionMode: PermissionMode;
-	teaching?: TeachingConfig;
+	learning?: LearningConfig;
+	teaching?: LearningConfig;
 }
 
 export interface MultiConfig extends SharkCodeConfig {
-	teaching: TeachingConfig;
+	learning: LearningConfig;
 }
 
 export const THINKING_LEVELS: readonly ThinkingLevel[] = [
@@ -74,7 +80,7 @@ export const THINKING_LEVELS: readonly ThinkingLevel[] = [
 	"xhigh",
 ];
 
-const TEACHING_VERBOSITIES: readonly TeachingVerbosity[] = [
+const LEARNING_VERBOSITIES: readonly LearningVerbosity[] = [
 	"简洁",
 	"标准",
 	"详细",
@@ -353,26 +359,40 @@ export function clampThinkingLevel(
 	return available.includes(normalized) ? normalized : "default";
 }
 
-function normalizeTeachingVerbosity(value?: unknown): TeachingVerbosity {
-	return TEACHING_VERBOSITIES.includes(value as TeachingVerbosity)
-		? (value as TeachingVerbosity)
+function normalizeLearningVerbosity(value?: unknown): LearningVerbosity {
+	return LEARNING_VERBOSITIES.includes(value as LearningVerbosity)
+		? (value as LearningVerbosity)
 		: "标准";
 }
 
-function normalizeTeachingConfig(raw?: {
+function normalizeLearningConfig(raw?: {
 	enabled?: unknown;
 	model?: unknown;
 	verbosity?: unknown;
-}): TeachingConfig {
+	autoCards?: unknown;
+	auto_cards?: unknown;
+	background?: unknown;
+}): LearningConfig {
 	const model =
 		typeof raw?.model === "string" && raw.model.trim()
 			? raw.model.trim()
+			: undefined;
+	const background =
+		typeof raw?.background === "string" && raw.background.trim()
+			? raw.background.trim()
 			: undefined;
 
 	return {
 		enabled: typeof raw?.enabled === "boolean" ? raw.enabled : false,
 		model,
-		verbosity: normalizeTeachingVerbosity(raw?.verbosity),
+		verbosity: normalizeLearningVerbosity(raw?.verbosity),
+		autoCards:
+			typeof raw?.autoCards === "boolean"
+				? raw.autoCards
+				: typeof raw?.auto_cards === "boolean"
+					? raw.auto_cards
+					: true,
+		background,
 	};
 }
 
@@ -384,7 +404,7 @@ const CONFIG_FILE = join(CONFIG_DIR, "config.toml");
 // ─── Serialization ────────────────────────────────────────────────────────────
 
 function serializeConfig(mc: MultiConfig): string {
-	const teaching = normalizeTeachingConfig(mc.teaching);
+	const learning = normalizeLearningConfig(mc.learning);
 	const lines = [
 		"# Shark Code Configuration",
 		"# https://github.com/syy-shark/sharkcode",
@@ -393,13 +413,18 @@ function serializeConfig(mc: MultiConfig): string {
 		`provider = "${mc.activeProvider}"`,
 		`permission_mode = "${mc.permissionMode}"`,
 		"",
-		"[teaching]",
-		`enabled = ${teaching.enabled}`,
-		`verbosity = "${teaching.verbosity}"`,
+		"[learning]",
+		`enabled = ${learning.enabled}`,
+		`verbosity = "${learning.verbosity}"`,
+		`auto_cards = ${learning.autoCards}`,
 	];
 
-	if (teaching.model) {
-		lines.push(`model = "${teaching.model}"`);
+	if (learning.model) {
+		lines.push(`model = "${learning.model}"`);
+	}
+
+	if (learning.background) {
+		lines.push(`background = "${learning.background}"`);
 	}
 
 	lines.push("");
@@ -446,7 +471,7 @@ function ensureConfig(): void {
 			activeProvider: "deepseek",
 			permissionMode: "prompt",
 			providers,
-			teaching: normalizeTeachingConfig(),
+			learning: normalizeLearningConfig(),
 		};
 		writeFileSync(CONFIG_FILE, serializeConfig(initial), "utf-8");
 	}
@@ -473,10 +498,12 @@ export function readMultiConfig(): MultiConfig {
 		Record<string, string>
 	>;
 	const defaultSection = (toml.default ?? {}) as Record<string, string>;
-	const teachingRaw = (toml.teaching ?? {}) as {
+	const learningRaw = (toml.learning ?? toml.teaching ?? {}) as {
 		enabled?: unknown;
 		model?: unknown;
 		verbosity?: unknown;
+		auto_cards?: unknown;
+		background?: unknown;
 	};
 
 	const providers: Record<string, ProviderEntry> = {};
@@ -514,13 +541,13 @@ export function readMultiConfig(): MultiConfig {
 		(defaultSection.permission_mode as PermissionMode) === "full-access"
 			? "full-access"
 			: "prompt";
-	const teaching = normalizeTeachingConfig(teachingRaw);
+	const learning = normalizeLearningConfig(learningRaw);
 
 	return {
 		activeProvider,
 		permissionMode,
 		providers,
-		teaching,
+		learning,
 	};
 }
 
@@ -532,7 +559,7 @@ export function saveMultiConfig(mc: MultiConfig): void {
 		CONFIG_FILE,
 		serializeConfig({
 			...mc,
-			teaching: normalizeTeachingConfig(mc.teaching),
+			learning: normalizeLearningConfig(mc.learning),
 		}),
 		"utf-8",
 	);

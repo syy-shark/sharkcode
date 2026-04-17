@@ -35,7 +35,7 @@ async function withTempHome<T>(
 
 	try {
 		const config = (await import(
-			`./config.ts?teaching-test=${Date.now()}-${Math.random()}`
+			`./config.ts?learning-test=${Date.now()}-${Math.random()}`
 		)) as typeof import("./config.ts");
 		return await run(config, tempHome);
 	} finally {
@@ -221,8 +221,8 @@ describe("thinking level helpers", () => {
 	});
 });
 
-describe("teaching config", () => {
-	test("defaults teaching settings when the section is missing", async () => {
+describe("learning config", () => {
+	test("defaults learning settings when the section is missing", async () => {
 		await withTempHome(async (config, tempHome) => {
 			const configDir = join(tempHome, ".sharkcode");
 			const configFile = join(configDir, "config.toml");
@@ -241,36 +241,41 @@ describe("teaching config", () => {
 
 			const multiConfig = config.readMultiConfig();
 
-			expect(multiConfig.teaching.enabled).toBe(false);
-			expect(multiConfig.teaching.verbosity).toBe("标准");
+			expect(multiConfig.learning.enabled).toBe(false);
+			expect(multiConfig.learning.verbosity).toBe("标准");
+			expect(multiConfig.learning.autoCards).toBe(true);
 		});
 	});
 
-	test("round-trips teaching settings through saveMultiConfig and readMultiConfig", async () => {
+	test("round-trips learning settings through saveMultiConfig and readMultiConfig", async () => {
 		await withTempHome(async (config) => {
 			const initial = config.readMultiConfig();
 
 			config.saveMultiConfig({
 				...initial,
 				activeProvider: "codex",
-				teaching: {
+				learning: {
 					enabled: true,
 					model: "gpt-4o-mini",
 					verbosity: "详细",
+					autoCards: false,
+					background: "前端开发",
 				},
 			});
 
 			const reloaded = config.readMultiConfig();
 
-			expect(reloaded.teaching).toEqual({
+			expect(reloaded.learning).toEqual({
 				enabled: true,
 				model: "gpt-4o-mini",
 				verbosity: "详细",
+				autoCards: false,
+				background: "前端开发",
 			});
 		});
 	});
 
-	test("clamps invalid teaching verbosity to 标准", async () => {
+	test("reads legacy [teaching] section into learning config", async () => {
 		await withTempHome(async (config, tempHome) => {
 			const configDir = join(tempHome, ".sharkcode");
 			const configFile = join(configDir, "config.toml");
@@ -294,9 +299,10 @@ describe("teaching config", () => {
 
 			const multiConfig = config.readMultiConfig();
 
-			expect(multiConfig.teaching.enabled).toBe(true);
-			expect(multiConfig.teaching.model).toBe("gpt-4o-mini");
-			expect(multiConfig.teaching.verbosity).toBe("标准");
+				expect(multiConfig.learning.enabled).toBe(true);
+				expect(multiConfig.learning.model).toBe("gpt-4o-mini");
+				expect(multiConfig.learning.verbosity).toBe("标准");
+				expect(multiConfig.learning.autoCards).toBe(true);
 		});
 	});
 });

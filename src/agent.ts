@@ -3,7 +3,7 @@ import chalk from "chalk";
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
 import { execSync } from "child_process";
-import { tools } from "./tools/index.ts";
+import { getToolsForRuntimePolicy } from "./tools/index.ts";
 import { createProvider, createProviderAsync, getProviderExecutionMode } from "./provider.ts";
 import { normalizeProviderModel, type Config } from "./config.ts";
 import { getMaxOutputTokens, getStreamProviderOptions } from "./provider-call-options.ts";
@@ -12,6 +12,7 @@ import { getCopilotRuntime } from "./copilot-models.ts";
 import { getCodexAuth } from "./codex-auth.ts";
 import { registerToolSpinner, unregisterToolSpinner } from "./spinnerState.ts";
 import { normalizeGenerateResult, normalizeStreamEvent } from "./agent-events.ts";
+import type { RuntimePolicy } from "./skills/types.ts";
 
 const PURPLE = chalk.hex("#a855f7");
 
@@ -28,6 +29,23 @@ const TOOL_LABELS: Record<string, { icon: string; verb: string }> = {
   think:           { icon: "💭", verb: "thinking" },
   playwright:      { icon: "🎭", verb: "browser" },
 };
+
+export interface SpinnerHost {
+  write: (text: string) => void;
+  setTimer: (tick: () => void, intervalMs: number) => unknown;
+  clearTimer: (handle: unknown) => void;
+}
+
+const DEFAULT_SPINNER_HOST: SpinnerHost = {
+  write: (text) => {
+    process.stdout.write(text);
+  },
+  setTimer: (tick, intervalMs) => setInterval(tick, intervalMs),
+  clearTimer: (handle) => clearInterval(handle as ReturnType<typeof setInterval>),
+};
+
+const SPINNER_INTERVAL_MS = 90;
+const SPINNER_BAR_LENGTH = 16;
 
 // ─── Glow-beam sweep animation ────────────────────────────────────────────────
 function playScanLine(): Promise<void> {
@@ -75,71 +93,110 @@ function createStreamCursor() {
   let frame = 0;
   let timer: ReturnType<typeof setInterval> | null = null;
   let lastCol = 0; // track how many chars to erase
+  let active = false;
+  let generation = 0;
+
+  function tick(runId: number) {
+    if (!active || runId !== generation) {
+      return;
+    }
+
+    const ch = cursorFrames[frame % cursorFrames.length]!;
+    const colored = chalk.hex("#a855f7")(ch);
+    if (lastCol > 0) process.stdout.write("\b \b");
+    process.stdout.write(colored);
+    lastCol = 1;
+    frame++;
+  }
 
   return {
     show() {
-      if (timer) return;
+      if (active) return;
+      active = true;
+      const runId = ++generation;
       timer = setInterval(() => {
-        const ch = cursorFrames[frame % cursorFrames.length]!;
-        const colored = chalk.hex("#a855f7")(ch);
-        // Erase previous cursor char, write new one
-        if (lastCol > 0) process.stdout.write("\b \b");
-        process.stdout.write(colored);
-        lastCol = 1;
-        frame++;
+        tick(runId);
       }, 80);
     },
     hide() {
+      active = false;
+      generation++;
       if (timer) {
         clearInterval(timer);
         timer = null;
-        if (lastCol > 0) {
-          process.stdout.write("\b \b");
-          lastCol = 0;
-        }
+      }
+      if (lastCol > 0) {
+        process.stdout.write("\b \b");
+        lastCol = 0;
       }
     },
   };
 }
 
-// ─── Gradient-pulse spinner ───────────────────────────────────────────────────
-function createSpinner(label: string) {
-  const barLen = 18;
-  const pulseW = 4;
-  const gradient = [
-    "#2e1065", "#4c1d95", "#5b21b6", "#6d28d9", "#7c3aed",
-    "#8b5cf6", "#a855f7", "#c084fc", "#d8b4fe", "#e9d5ff",
-  ];
-  const sparks = ["✦", "◆", "✧", "◇"];
+export function renderSpinnerFrame(frame: number, label: string): string {
+  const head = frame % SPINNER_BAR_LENGTH;
+  let bar = "";
+
+  for (let i = 0; i < SPINNER_BAR_LENGTH; i++) {
+    if (i === head) {
+      bar += chalk.hex("#e9d5ff")("━");
+    } else {
+      bar += chalk.hex("#4c1d95")("━");
+    }
+  }
+
+  return `\r  ${chalk.hex("#c084fc")("◇")} ${bar} ${chalk.gray(label)}`;
+}
+
+// ─── Single-highlight spinner ─────────────────────────────────────────────────
+export function createSpinner(label: string, host: SpinnerHost = DEFAULT_SPINNER_HOST) {
   let frame = 0;
-  let timer: ReturnType<typeof setInterval> | null = null;
+  let timer: unknown = null;
+  let active = false;
+  let generation = 0;
+  let currentLabel = label;
+  let wroteFrame = false;
+
+  function tick(runId: number) {
+    if (!active || runId !== generation) {
+      return;
+    }
+
+    host.write(renderSpinnerFrame(frame, currentLabel));
+    wroteFrame = true;
+    frame = (frame + 1) % SPINNER_BAR_LENGTH;
+  }
 
   return {
     start() {
-      timer = setInterval(() => {
-        const spark = chalk.hex("#c084fc")(sparks[frame % sparks.length]!);
-        const center = (frame % (barLen + pulseW * 2)) - pulseW;
-        let bar = "";
-        for (let i = 0; i < barLen; i++) {
-          const d = Math.abs(i - center);
-          if (d <= pulseW) {
-            const ratio = (pulseW - d) / pulseW;
-            const idx = Math.round(ratio * (gradient.length - 1));
-            bar += chalk.hex(gradient[idx]!)("━");
-          } else {
-            bar += chalk.hex("#2e1065")("━");
-          }
-        }
-        process.stdout.write(`\r  ${spark} ${bar} ${chalk.gray(label)}`);
-        frame++;
-      }, 50);
+      if (active) {
+        return;
+      }
+
+      active = true;
+      frame = 0;
+      const runId = ++generation;
+      tick(runId);
+      timer = host.setTimer(() => {
+        tick(runId);
+      }, SPINNER_INTERVAL_MS);
     },
     stop() {
-      if (timer) {
-        clearInterval(timer);
+      active = false;
+      generation++;
+
+      if (timer !== null) {
+        host.clearTimer(timer);
         timer = null;
-        process.stdout.write("\r\x1b[K");
       }
+
+      if (wroteFrame) {
+        host.write("\r\x1b[K");
+        wroteFrame = false;
+      }
+    },
+    setLabel(nextLabel: string) {
+      currentLabel = nextLabel;
     },
   };
 }
@@ -318,7 +375,11 @@ function getGitContext(): string | null {
   }
 }
 
-function buildSystemPrompt(): string {
+export interface AgentPromptOptions {
+  systemReminders?: string[];
+}
+
+function buildSystemPrompt(options: AgentPromptOptions = {}): string {
   const os = process.platform === "win32" ? "Windows" : process.platform === "darwin" ? "macOS" : "Linux";
   const shell = process.platform === "win32" ? "cmd.exe" : "bash";
 
@@ -349,6 +410,11 @@ Environment:
   const instructions = readProjectInstructions();
   if (instructions) {
     parts.push(`\n<project_instructions>\n${instructions}\n</project_instructions>`);
+  }
+
+  const reminders = options.systemReminders?.map((item) => item.trim()).filter(Boolean) ?? [];
+  if (reminders.length > 0) {
+    parts.push(`\n<system_reminders>\n${reminders.join("\n\n")}\n</system_reminders>`);
   }
 
   // Tools
@@ -545,6 +611,11 @@ export interface RunAgentResult {
   partialText: string;
 }
 
+export interface RunAgentOptions {
+  runtimePolicy?: RuntimePolicy;
+  systemReminders?: string[];
+}
+
 function summarizeToolOutput(output: unknown): string {
   if (typeof output === "string") {
     return truncate(output, 80);
@@ -557,8 +628,9 @@ function summarizeToolOutput(output: unknown): string {
   }
 }
 
-function renderGeneratedSteps(
+export function renderGeneratedSteps(
   steps: Array<{ content: Array<Record<string, unknown>> }>,
+  renderTerminalOutput = true,
 ): string {
   let printedText = "";
 
@@ -570,26 +642,40 @@ function renderGeneratedSteps(
         const argHint = getArgHint(toolName, part.input);
         const cols = Math.min(process.stdout.columns ?? 80, 60);
 
-        process.stdout.write(`  ${chalk.hex("#4c1d95")("─".repeat(cols - 4))}\n`);
-        process.stdout.write(
-          `  ${meta.icon} ${PURPLE(meta.verb)}${argHint ? chalk.dim(" › ") + chalk.white(argHint) : ""}\n`
-        );
+        if (renderTerminalOutput) {
+          process.stdout.write(`  ${chalk.hex("#4c1d95")("─".repeat(cols - 4))}\n`);
+          process.stdout.write(
+            `  ${meta.icon} ${PURPLE(meta.verb)}${argHint ? chalk.dim(" › ") + chalk.white(argHint) : ""}\n`
+          );
+        }
       }
 
       if (part.type === "tool-result") {
-        process.stdout.write(
-          `  ${chalk.green("✓")} ${chalk.dim(summarizeToolOutput(part.output))}\n`
-        );
+        if (renderTerminalOutput) {
+          process.stdout.write(
+            `  ${chalk.green("✓")} ${chalk.dim(summarizeToolOutput(part.output))}\n`
+          );
+        }
+      }
+
+      if (part.type === "tool-error") {
+        if (renderTerminalOutput) {
+          process.stderr.write(
+            chalk.red(`  ✗ [${typeof part.toolName === "string" ? part.toolName : "tool"}] ${String(part.error)}\n`)
+          );
+        }
       }
 
       if (part.type === "text" && typeof part.text === "string" && part.text.length > 0) {
-        process.stdout.write(part.text);
+        if (renderTerminalOutput) {
+          process.stdout.write(part.text);
+        }
         printedText += part.text;
       }
     }
   }
 
-  if (printedText && !printedText.endsWith("\n")) {
+  if (renderTerminalOutput && printedText && !printedText.endsWith("\n")) {
     process.stdout.write("\n");
   }
 
@@ -602,11 +688,13 @@ function getNormalizedGeneratedSteps(
   text?: string;
   toolCalls?: Array<{ toolName: string; args: unknown }>;
   toolResults?: Array<{ toolName: string; result: unknown }>;
+  toolErrors?: Array<{ toolName: string; error: unknown }>;
 }> {
   return steps.map((step) => {
     let text = "";
     const toolCalls: Array<{ toolName: string; args: unknown }> = [];
     const toolResults: Array<{ toolName: string; result: unknown }> = [];
+    const toolErrors: Array<{ toolName: string; error: unknown }> = [];
 
     for (const part of step.content) {
       if (part.type === "text" && typeof part.text === "string" && part.text.length > 0) {
@@ -620,12 +708,17 @@ function getNormalizedGeneratedSteps(
       if (part.type === "tool-result" && typeof part.toolName === "string") {
         toolResults.push({ toolName: part.toolName, result: part.output });
       }
+
+      if (part.type === "tool-error" && typeof part.toolName === "string") {
+        toolErrors.push({ toolName: part.toolName, error: part.error });
+      }
     }
 
     return {
       text: text || undefined,
       toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
       toolResults: toolResults.length > 0 ? toolResults : undefined,
+      toolErrors: toolErrors.length > 0 ? toolErrors : undefined,
     };
   });
 }
@@ -659,6 +752,8 @@ export async function runAgent(
   config: Config,
   abortSignal?: AbortSignal,
   eventBus?: import("./agent-events.ts").AgentEventBus,
+  renderTerminalOutput = !eventBus,
+  options: RunAgentOptions = {},
 ): Promise<RunAgentResult> {
   let useCodexSubscriptionInstructions = false;
   let copilotTransport: CopilotTransport = "chat";
@@ -686,11 +781,17 @@ export async function runAgent(
     : createProvider(config);
 
   const compacted = compactMessages(messages);
-  const systemPrompt = buildSystemPrompt();
+  const systemPrompt = buildSystemPrompt({ systemReminders: options.systemReminders });
+  const availableTools = getToolsForRuntimePolicy(options.runtimePolicy ?? "full-access");
 
   if (executionMode === "generate") {
     const thinkingSpinner = createSpinner("thinking...");
-    thinkingSpinner.start();
+    if (renderTerminalOutput) {
+      thinkingSpinner.start();
+    }
+    if (eventBus) {
+      eventBus.emit({ type: "run-start" });
+    }
 
     try {
       const result = await generateText({
@@ -702,7 +803,7 @@ export async function runAgent(
           useCodexSubscriptionInstructions ? systemPrompt : undefined,
           copilotTransport,
         ),
-        tools,
+        tools: availableTools,
         maxRetries: 2,
         maxOutputTokens: getMaxOutputTokens(config),
         stopWhen: stepCountIs(50),
@@ -712,32 +813,33 @@ export async function runAgent(
       thinkingSpinner.stop();
 
       const renderableSteps = result.steps as Array<{ content: Array<Record<string, unknown>> }>;
-      const generatedText = renderGeneratedSteps(renderableSteps);
+      const generatedText = renderGeneratedSteps(renderableSteps, renderTerminalOutput);
 
       if (eventBus) {
         const events = normalizeGenerateResult({
           text: result.text,
           steps: getNormalizedGeneratedSteps(renderableSteps),
         });
-        for (const event of events) {
+        for (const event of events.slice(1, -1)) {
           eventBus.emit(event);
         }
+        eventBus.emit({ type: "run-end", interrupted: false });
       }
 
       const finishReason = result.steps.at(-1)?.finishReason;
-      if (finishReason === "length") {
+      if (renderTerminalOutput && finishReason === "length") {
         process.stderr.write(
           chalk.yellow("\n  ⚠ 输出因 token 限制被截断。") +
           chalk.gray(" 大文件可能未完整写入，请检查并重试（可尝试分段生成）。\n")
         );
-      } else if (finishReason === "content-filter") {
+      } else if (renderTerminalOutput && finishReason === "content-filter") {
         process.stderr.write(
           chalk.yellow("\n  ⚠ 输出被内容过滤器截断。\n")
         );
       }
 
       const usage = await result.totalUsage;
-      if (usage) {
+      if (renderTerminalOutput && usage) {
         process.stderr.write(
           chalk.dim(`  📊 ${usage.inputTokens}↑ ${usage.outputTokens}↓  steps:${result.steps.length}\n`)
         );
@@ -756,7 +858,12 @@ export async function runAgent(
         err instanceof Error &&
         (err.name === "AbortError" || err.message.includes("abort"))
       ) {
-        process.stdout.write(chalk.yellow("\n  ⏹ 已中断\n"));
+        if (eventBus) {
+          eventBus.emit({ type: "run-end", interrupted: true });
+        }
+        if (renderTerminalOutput) {
+          process.stdout.write(chalk.yellow("\n  ⏹ 已中断\n"));
+        }
         return { messages, interrupted: true, partialText: "" };
       }
 
@@ -773,7 +880,7 @@ export async function runAgent(
       useCodexSubscriptionInstructions ? systemPrompt : undefined,
       copilotTransport,
     ),
-    tools,
+    tools: availableTools,
     maxRetries: 2,
     maxOutputTokens: getMaxOutputTokens(config),
     stopWhen: stepCountIs(50),
@@ -786,6 +893,7 @@ export async function runAgent(
   let thinkingDone = false;
   let isStreaming = false;
   let interrupted = false;
+  let fatalError: unknown = null;
   let partialText = "";
 
   // Track consecutive trailing newlines written to stdout so we can collapse
@@ -800,6 +908,7 @@ export async function runAgent(
 
   function writeOut(text: string) {
     if (!text) return;
+    if (!renderTerminalOutput) return;
     process.stdout.write(text);
     for (const ch of text) {
       if (ch === "\n") trailingNL++;
@@ -809,6 +918,10 @@ export async function runAgent(
 
   // Collapse all but `keep` trailing blank lines using ANSI cursor-up + clear.
   function collapseNL(keep = 1) {
+    if (!renderTerminalOutput) {
+      return;
+    }
+
     if (trailingNL > keep) {
       const remove = trailingNL - keep;
       process.stdout.write(`\x1b[${remove}A\x1b[J`);
@@ -820,7 +933,28 @@ export async function runAgent(
   let toolSpinner: ReturnType<typeof createSpinner> | null = null;
   let currentToolName = "";
 
-  thinkingSpinner.start();
+  function stopComposingSpinner() {
+    if (composingSpinner) {
+      composingSpinner.stop();
+      composingSpinner = null;
+    }
+    composingToolName = "";
+    composingBytes = 0;
+  }
+
+  function stopActiveToolSpinner() {
+    if (toolSpinner) {
+      toolSpinner.stop();
+      toolSpinner = null;
+    }
+    if (renderTerminalOutput) {
+      unregisterToolSpinner();
+    }
+  }
+
+  if (renderTerminalOutput) {
+    thinkingSpinner.start();
+  }
   if (eventBus) eventBus.emit({ type: "run-start" });
 
   try {
@@ -845,25 +979,27 @@ export async function runAgent(
           // Prevent accumulating multiple blank lines — collapse immediately
           if (trailingNL >= 2) collapseNL(1);
           // Hide cursor before writing, then re-show for live effect
-          streamCursor.hide();
+          if (renderTerminalOutput) {
+            streamCursor.hide();
+          }
           writeOut(event.text);
           partialText += event.text;
           if (!isStreaming) isStreaming = true;
-          streamCursor.show();
+          if (renderTerminalOutput) {
+            streamCursor.show();
+          }
           break;
 
         case "tool-call": {
           // Hide streaming cursor when transitioning to tool execution
-          streamCursor.hide();
+          if (renderTerminalOutput) {
+            streamCursor.hide();
+          }
           isStreaming = false;
 
           // Stop composing spinner if still running
-          if (composingSpinner) {
-            composingSpinner.stop();
-            composingSpinner = null;
-            composingToolName = "";
-            composingBytes = 0;
-          }
+          stopComposingSpinner();
+          stopActiveToolSpinner();
 
           const meta = TOOL_LABELS[event.toolName] ?? { icon: "🔧", verb: "running" };
           currentToolName = event.toolName;
@@ -875,65 +1011,70 @@ export async function runAgent(
           if (trailingNL === 0) writeOut("\n");
 
           // Thin separator + compact tool header on ONE line
-          const cols = Math.min(process.stdout.columns ?? 80, 60);
-          process.stdout.write(`  ${chalk.hex("#4c1d95")("─".repeat(cols - 4))}\n`);
-          process.stdout.write(
-            `  ${meta.icon} ${PURPLE(meta.verb)}${argHint ? chalk.dim(" › ") + chalk.white(argHint) : ""}\n`
-          );
+          if (renderTerminalOutput) {
+            const cols = Math.min(process.stdout.columns ?? 80, 60);
+            process.stdout.write(`  ${chalk.hex("#4c1d95")("─".repeat(cols - 4))}\n`);
+            process.stdout.write(
+              `  ${meta.icon} ${PURPLE(meta.verb)}${argHint ? chalk.dim(" › ") + chalk.white(argHint) : ""}\n`
+            );
+          }
 
           // Spinner starts immediately on next line
           toolSpinner = createSpinner(`${meta.verb}...`);
-          registerToolSpinner(() => toolSpinner?.stop());
-          toolSpinner.start();
+          if (renderTerminalOutput) {
+            registerToolSpinner(stopActiveToolSpinner);
+            toolSpinner.start();
+          }
 
           trailingNL = 0;
           break;
         }
 
         case "tool-result": {
-          if (toolSpinner) {
-            toolSpinner.stop();
-            toolSpinner = null;
-            unregisterToolSpinner();
-          }
+          stopActiveToolSpinner();
           const summary = truncate(String(event.output), 80);
           // Single compact result line
-          process.stdout.write(
-            `  ${chalk.green("✓")} ${chalk.dim(summary)}\n`
-          );
+          if (renderTerminalOutput) {
+            process.stdout.write(
+              `  ${chalk.green("✓")} ${chalk.dim(summary)}\n`
+            );
+          }
           trailingNL = 1;
           break;
         }
 
         case "tool-error":
-          if (toolSpinner) {
-            toolSpinner.stop();
-            toolSpinner = null;
-            unregisterToolSpinner();
+          stopActiveToolSpinner();
+          if (renderTerminalOutput) {
+            process.stderr.write(
+              chalk.red(`  ✗ [${event.toolName}] ${String(event.error)}\n`)
+            );
           }
-          process.stderr.write(
-            chalk.red(`  ✗ [${event.toolName}] ${String(event.error)}\n`)
-          );
           trailingNL = 1;
           break;
 
         // ── Tool-input streaming (bridges the "frozen" gap during large arg generation) ──
         case "tool-input-start": {
           // Model just started generating tool arguments — show a composing spinner
-          streamCursor.hide();
+          if (renderTerminalOutput) {
+            streamCursor.hide();
+          }
           isStreaming = false;
 
           // Collapse ALL trailing blank lines so spinner appears tight below content
           collapseNL(0);
           if (trailingNL === 0) writeOut("\n");
 
+          stopComposingSpinner();
           composingToolName = event.toolName;
           composingBytes = 0;
 
           const meta = TOOL_LABELS[event.toolName] ?? { icon: "🔧", verb: "running" };
           const label = `composing ${meta.verb} input...`;
           composingSpinner = createSpinner(label);
-          composingSpinner.start();
+          if (renderTerminalOutput) {
+            composingSpinner.start();
+          }
           break;
         }
 
@@ -948,9 +1089,7 @@ export async function runAgent(
             const prevKbRounded = Math.floor((composingBytes - event.delta.length) / 2048);
             if (kbRounded !== prevKbRounded || composingBytes - event.delta.length <= 500) {
               const meta = TOOL_LABELS[composingToolName] ?? { icon: "🔧", verb: "running" };
-              composingSpinner.stop();
-              composingSpinner = createSpinner(`composing ${meta.verb} input... ${kb}KB`);
-              composingSpinner.start();
+              composingSpinner.setLabel(`composing ${meta.verb} input... ${kb}KB`);
             }
           }
           break;
@@ -959,12 +1098,7 @@ export async function runAgent(
         case "tool-input-end": {
           // Tool argument generation complete — clean up composing spinner
           // (tool-call event will follow immediately and start its own animation)
-          if (composingSpinner) {
-            composingSpinner.stop();
-            composingSpinner = null;
-          }
-          composingToolName = "";
-          composingBytes = 0;
+          stopComposingSpinner();
           break;
         }
 
@@ -975,8 +1109,10 @@ export async function runAgent(
             // Already have thinkingSpinner running
           } else {
             // Restart thinking spinner for multi-step reasoning
-            streamCursor.hide();
-            thinkingSpinner.start();
+            if (renderTerminalOutput) {
+              streamCursor.hide();
+              thinkingSpinner.start();
+            }
           }
           break;
         }
@@ -998,17 +1134,23 @@ export async function runAgent(
         }
 
         case "finish-step":
-          streamCursor.hide();
+          if (renderTerminalOutput) {
+            streamCursor.hide();
+          }
           isStreaming = false;
           currentStep++;
           break;
 
         case "error":
-          streamCursor.hide();
-          if (composingSpinner) { composingSpinner.stop(); composingSpinner = null; }
-          if (toolSpinner) { toolSpinner.stop(); toolSpinner = null; unregisterToolSpinner(); }
+          if (renderTerminalOutput) {
+            streamCursor.hide();
+          }
+          stopComposingSpinner();
+          stopActiveToolSpinner();
           thinkingSpinner.stop();
-          process.stderr.write(chalk.red(`\n❌ ${String(event.error)}\n`));
+          if (renderTerminalOutput) {
+            process.stderr.write(chalk.red(`\n❌ ${String(event.error)}\n`));
+          }
           trailingNL = 1;
           break;
       }
@@ -1026,22 +1168,27 @@ export async function runAgent(
     ) {
       interrupted = true;
     } else {
-      // Re-throw non-abort errors
-      throw err;
+      fatalError = err;
     }
   }
 
   // Ensure spinners are always stopped
   thinkingSpinner.stop();
   streamCursor.hide();
-  if (composingSpinner) { composingSpinner.stop(); composingSpinner = null; }
-  if (toolSpinner) { toolSpinner.stop(); unregisterToolSpinner(); }
+  stopComposingSpinner();
+  stopActiveToolSpinner();
 
   if (eventBus) eventBus.emit({ type: "run-end", interrupted });
 
+  if (fatalError) {
+    throw fatalError;
+  }
+
   if (interrupted) {
     // Show interruption indicator
-    process.stdout.write(chalk.yellow("\n  ⏹ 已中断\n"));
+    if (renderTerminalOutput) {
+      process.stdout.write(chalk.yellow("\n  ⏹ 已中断\n"));
+    }
 
     // Return partial conversation — include whatever assistant text we got
     if (partialText.trim()) {
@@ -1057,23 +1204,23 @@ export async function runAgent(
     return { messages, interrupted: true, partialText };
   }
 
-  if (trailingNL === 0) process.stdout.write("\n");
+  if (renderTerminalOutput && trailingNL === 0) process.stdout.write("\n");
 
   // Detect truncated output (e.g. CSS file written halfway because token limit hit)
   const finishReason = await result.finishReason;
-  if (finishReason === "length") {
+  if (renderTerminalOutput && finishReason === "length") {
     process.stderr.write(
       chalk.yellow("\n  ⚠ 输出因 token 限制被截断。") +
       chalk.gray(" 大文件可能未完整写入，请检查并重试（可尝试分段生成）。\n")
     );
-  } else if (finishReason === "content-filter") {
+  } else if (renderTerminalOutput && finishReason === "content-filter") {
     process.stderr.write(
       chalk.yellow("\n  ⚠ 输出被内容过滤器截断。\n")
     );
   }
 
   const usage = await result.totalUsage;
-  if (usage) {
+  if (renderTerminalOutput && usage) {
     process.stderr.write(
       chalk.dim(`  📊 ${usage.inputTokens}↑ ${usage.outputTokens}↓  steps:${currentStep}\n`)
     );

@@ -97,6 +97,18 @@ describe("normalizeStreamEvent", () => {
     });
   });
 
+  test("tool-error normalized correctly", () => {
+    expect(normalizeStreamEvent({
+      type: "tool-error",
+      toolName: "playwright",
+      error: "snapshot failed",
+    })).toEqual({
+      type: "tool-error",
+      toolName: "playwright",
+      error: "snapshot failed",
+    });
+  });
+
   test("reasoning/thinking normalized correctly", () => {
     expect(normalizeStreamEvent({ type: "reasoning", textDelta: "thinking" })).toEqual({
       type: "thinking-delta",
@@ -117,6 +129,7 @@ describe("normalizeGenerateResult", () => {
           text: "Plan ready",
           toolCalls: [{ toolName: "grep", args: { pattern: "AgentEvent" } }],
           toolResults: [{ toolName: "grep", result: 2 }],
+          toolErrors: [{ toolName: "playwright", error: "snapshot failed" }],
         },
         {
           text: "Done",
@@ -128,6 +141,7 @@ describe("normalizeGenerateResult", () => {
       { type: "text-delta", delta: "Plan ready" },
       { type: "tool-call", toolName: "grep", args: { pattern: "AgentEvent" } },
       { type: "tool-result", toolName: "grep", result: "2" },
+      { type: "tool-error", toolName: "playwright", error: "snapshot failed" },
       { type: "step-end", stepIndex: 0 },
       { type: "step-start", stepIndex: 1 },
       { type: "text-delta", delta: "Done" },

@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import chalk from "chalk";
@@ -16,10 +16,10 @@ import {
   type Config,
   type MultiConfig,
   type PermissionMode,
-  type TeachingVerbosity,
+  type LearningVerbosity,
   type ThinkingLevel,
 } from "./config.ts";
-import { runAgent } from "./agent.ts";
+import { createSpinner, runAgent } from "./agent.ts";
 import { setPermissionMode, getPermissionMode } from "./permission.ts";
 import { createInterruptController, triggerInterrupt, resetInterrupt } from "./interrupt.ts";
 import { parseImagesFromInput, buildUserContent } from "./image.ts";
@@ -27,12 +27,51 @@ import { checkForAvailableUpdate, getUpdateCommand, runGlobalUpdate, type Availa
 import { loginWithDeviceFlow, isCopilotLoggedIn, clearCopilotAuth } from "./copilot-auth.ts";
 import { getCopilotPresetModels } from "./copilot-models.ts";
 import { loginWithCodexDeviceFlow, isCodexLoggedIn, clearCodexAuth } from "./codex-auth.ts";
-import { createProvider } from "./provider.ts";
+import { createProvider, createProviderAsync } from "./provider.ts";
 import { AgentEventBus } from "./agent-events.ts";
-import { TeachingOrchestrator } from "./teaching.ts";
-import { canUseEducationalMode, printFallbackNotice } from "./teaching-fallback.ts";
-import { startEducationalApp } from "./ui/EducationalApp.tsx";
+import type { TeachingContext } from "./teaching.ts";
+import { handleLearnCommand, type LearnMenuAction } from "./learning/commands.ts";
+import { detectLearningSignal } from "./learning/detector.ts";
+import { formatLessonHint, formatLessonRecap, generateLearningLesson } from "./learning/lesson.ts";
+import { answerLearningFollowUp, formatLearningFollowUpAnswer } from "./learning/follow-up.ts";
+import { planLearningProject } from "./learning/project-planner.ts";
+import {
+  applyLessonToProfile,
+  readLearningProfile,
+  saveLearningProfile,
+} from "./learning/profile.ts";
+import { reviewLearningPrompt } from "./learning/prompt-coach.ts";
+import { formatLearningProgress } from "./learning/progress.ts";
+import {
+  advanceLearningProject,
+  formatLearningProjectCurrent,
+  formatLearningProjectHint,
+  formatLearningProjectLaunch,
+  getLearningProjectSnapshot,
+  rememberLearningProject,
+} from "./learning/project.ts";
+import {
+  evaluateLearningQuizAnswer,
+  formatLearningQuizPrompt,
+  selectLearningQuizQuestion,
+} from "./learning/quiz.ts";
+import {
+  createLearningSessionState,
+  rememberLearningFollowUp,
+  rememberLearningLesson,
+} from "./learning/state.ts";
+import type { LearningProfile, LearningSessionState } from "./learning/types.ts";
 import type { ModelMessage } from "ai";
+import {
+  createDetachedSessionState,
+  createSessionDraft,
+  createSessionFromPrompt,
+  listSessionSummaries,
+  readSession,
+  saveSession,
+} from "./session/store.ts";
+import type { PersistedSession, SessionDraft, SessionMode } from "./session/types.ts";
+import { findAvailableSkill, listAvailableSkills, normalizeSkillId, resolveSkillContext } from "./skills/loader.ts";
 
 // ─── Colors ───────────────────────────────────────────────────────────────────
 const PURPLE = chalk.hex("#a855f7");
@@ -41,6 +80,41 @@ const YELLOW = chalk.yellow;
 const GREEN  = chalk.green;
 const RED    = chalk.red;
 const CYAN   = chalk.cyan;
+
+export function ensureRunEnd(
+  eventBus: AgentEventBus | undefined,
+  didReceiveRunEnd: boolean,
+): boolean {
+  if (!eventBus || didReceiveRunEnd) {
+    return didReceiveRunEnd;
+  }
+
+  eventBus.emit({ type: "run-end", interrupted: false });
+  return true;
+}
+
+function restoreStdinRawMode(): void {
+  try {
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+  } catch {
+    // Ignore non-TTY stdin so tests and piped execution keep working.
+  }
+}
+
+async function withSpinner<T>(label: string, task: () => Promise<T>): Promise<T> {
+  if (!process.stdout.isTTY) {
+    return task();
+  }
+
+  const spinner = createSpinner(label);
+  spinner.start();
+  try {
+    return await task();
+  } finally {
+    spinner.stop();
+  }
+}
 
 // ─── Read version from package.json ───────────────────────────────────────────
 function getVersion(): string {
@@ -141,6 +215,11 @@ interface SlashResult {
   config: Config;
   clearHistory?: boolean;
   exit?: boolean;
+}
+
+interface SessionRuntimeState {
+  currentSession: PersistedSession | null;
+  pendingSessionDraft: SessionDraft | null;
 }
 
 const CUSTOM_MODEL_VALUE = "__custom_model__";
@@ -258,6 +337,45 @@ async function showThinkingSetupFlow(multiConfig: MultiConfig): Promise<SlashRes
   return { multiConfig: updated, config };
 }
 
+// ─── Quick model switch (for /model command) ─────────────────────────────────
+async function showModelSwitchFlow(multiConfig: MultiConfig): Promise<SlashResult> {
+  const providerName = multiConfig.activeProvider;
+  const providerLabel = PROVIDERS[providerName]?.label ?? providerName;
+  const currentEntry = multiConfig.providers[providerName];
+  const currentModel = currentEntry?.model ?? PROVIDERS[providerName]?.defaultModel ?? "";
+
+  console.log(GRAY(`\n  当前 Provider: ${providerLabel}\n`));
+
+  try {
+    const newModel = await promptForModelSelection(providerName, currentModel);
+
+    if (newModel === currentModel) {
+      console.log(GRAY("\n  模型未更改\n"));
+      return { multiConfig, config: resolveConfig(multiConfig) };
+    }
+
+    const updated: MultiConfig = {
+      ...multiConfig,
+      providers: {
+        ...multiConfig.providers,
+        [providerName]: {
+          ...(multiConfig.providers[providerName] ?? {}),
+          key: multiConfig.providers[providerName]?.key ?? "",
+          model: newModel,
+        },
+      },
+    };
+
+    saveMultiConfig(updated);
+    const config = resolveConfig(updated);
+    console.log(GREEN(`\n  ✓ 模型已切换为 ${newModel}\n`));
+    return { multiConfig: updated, config };
+  } catch {
+    console.log(GRAY("\n  取消\n"));
+    return { multiConfig, config: resolveConfig(multiConfig) };
+  }
+}
+
 // ─── Interactive command menu (triggered by bare "/") ─────────────────────────
 async function showCommandMenu(multiConfig: MultiConfig): Promise<SlashResult> {
   console.log();
@@ -271,10 +389,14 @@ async function showCommandMenu(multiConfig: MultiConfig): Promise<SlashResult> {
       message: PURPLE("◆ 选择操作") + GRAY("  (Esc / Ctrl+C 返回)"),
       choices: [
         { name: "↩   返回聊天",                value: "back"      },
+        { name: "🗂  Session",                 value: "session"   },
+        { name: "⚒  Build / Plan",            value: "mode"      },
+        { name: "🧩  Skill",                   value: "skill"     },
         { name: "🔌  切换 / 配置 Provider",    value: "provider"  },
         { name: "🧠  调整思考水平",            value: "thinking"  },
+        { name: multiConfig.learning.enabled ? "🎓  关闭上课模式" : "🎓  开启上课模式", value: "learn" },
         { name: permLabel,                      value: "permission"},
-        { name: "🗑️  清空对话历史",              value: "clear"     },
+        { name: "🗑️  退出当前 Session",          value: "clear"     },
         { name: "🚪  退出",                      value: "exit"      },
       ],
     });
@@ -284,9 +406,27 @@ async function showCommandMenu(multiConfig: MultiConfig): Promise<SlashResult> {
         return { multiConfig, config: resolveConfig(multiConfig) };
       case "provider":   return showSetupFlow(multiConfig);
       case "thinking":   return showThinkingSetupFlow(multiConfig);
+      case "session":
+        console.log(GRAY("\n  提示：使用 /session new | /session list | /session switch <id>\n"));
+        return { multiConfig, config: resolveConfig(multiConfig) };
+      case "mode":
+        console.log(GRAY("\n  提示：使用 Tab 或 /mode <build|plan> 切换模式\n"));
+        return { multiConfig, config: resolveConfig(multiConfig) };
+      case "skill":
+        console.log(GRAY("\n  提示：使用 /skill list | /skill use <name> 管理 skills\n"));
+        return { multiConfig, config: resolveConfig(multiConfig) };
+      case "learn": {
+        const updated: MultiConfig = {
+          ...multiConfig,
+          learning: { ...multiConfig.learning, enabled: !multiConfig.learning.enabled },
+        };
+        saveMultiConfig(updated);
+        console.log(GREEN(`\n  ✓ 上课模式已${updated.learning.enabled ? "开启" : "关闭"}\n`));
+        return { multiConfig: updated, config: resolveConfig(updated) };
+      }
       case "permission": return togglePermissionMode(multiConfig);
       case "clear":
-        console.log(GRAY("\n  ✓ 对话已清空\n"));
+        console.log(GRAY("\n  ✓ 已退出当前 session\n"));
         return { multiConfig, config: resolveConfig(multiConfig), clearHistory: true };
       case "exit":
         console.log(GRAY("\nBye! 🦈"));
@@ -390,6 +530,55 @@ async function promptForModelSelection(selectedProvider: string, currentModel: s
   });
 
   return rawModel.trim() || currentModel;
+}
+
+async function promptForLearningModelSelection(multiConfig: MultiConfig): Promise<string> {
+  const providerName = multiConfig.activeProvider;
+  const meta = PROVIDERS[providerName];
+  const currentModel = multiConfig.learning.model?.trim() ?? "";
+  const presetModels = providerName === "copilot"
+    ? await getCopilotPresetModels()
+    : PROVIDERS[providerName]?.presetModels ?? [];
+  const modelHint = currentModel
+    ? GRAY(`(回车保留 ${currentModel})`)
+    : GRAY("(必须显式设置上课模型)");
+
+  const presetIds = new Set(presetModels.map((model) => model.id));
+  const choices: Array<{ name: string; value: string }> = [];
+
+  if (currentModel && !presetIds.has(currentModel)) {
+    choices.push({
+      name: `保留当前自定义模型 (${currentModel})`,
+      value: currentModel,
+    });
+  }
+
+  choices.push(
+    ...presetModels.map((model) => ({
+      name: formatPresetModelChoiceName(model, currentModel, meta?.defaultModel ?? ""),
+      value: model.id,
+    })),
+  );
+  choices.push({ name: "手动输入其他模型", value: CUSTOM_MODEL_VALUE });
+
+  const selectedValue = await select({
+    message: PURPLE("◆ 上课模型"),
+    choices,
+    default: currentModel && choices.some((choice) => choice.value === currentModel)
+      ? currentModel
+      : meta?.defaultModel,
+  });
+
+  if (selectedValue !== CUSTOM_MODEL_VALUE) {
+    return selectedValue;
+  }
+
+  const rawModel = await input({
+    message: PURPLE("◆ 上课模型 ") + modelHint,
+    default: currentModel || undefined,
+  });
+
+  return rawModel.trim() || currentModel || meta?.defaultModel || "";
 }
 
 // ─── GitHub Copilot inline device flow (used from showSetupFlow) ─────────────
@@ -655,16 +844,27 @@ interface SlashCommand {
 }
 
 const SLASH_COMMANDS: SlashCommand[] = [
+  { name: "/session",    description: "查看 / 切换历史任务" },
+  { name: "/session new", description: "开始一个新任务" },
+  { name: "/session list", description: "列出历史任务" },
+  { name: "/session current", description: "查看当前任务" },
+  { name: "/mode",       description: "切换 Build / Plan 模式" },
+  { name: "/skill",      description: "查看 / 启用技能" },
   { name: "/provider",   description: "切换 / 配置 Provider（含订阅登录）" },
   { name: "/model",      description: "切换模型" },
-  { name: "/thinking",   description: "调整 OpenAI / Codex / Copilot 思考水平" },
-  { name: "/teach",      description: "开启/关闭教育模式" },
-  { name: "/teach off",  description: "关闭教育模式" },
-  { name: "/teach model", description: "设置教学模型（如 gpt-4o-mini）" },
-  { name: "/teach level", description: "设置教学详略 (简洁/标准/详细)" },
-  { name: "/key",        description: "设置 API Key" },
-  { name: "/login",      description: "登录 GitHub Copilot（快捷方式）" },
-  { name: "/logout",     description: "退出 Copilot / Codex 登录" },
+  { name: "/thinking",   description: "调整思考水平" },
+  { name: "/permission", description: "切换权限模式（默认 / Full Access）" },
+  { name: "/learn",      description: "打开学习中心 / 开启或关闭上课模式" },
+  { name: "/learn start", description: "启动一个 Vibe Coding 引导项目" },
+  { name: "/learn next", description: "查看当前引导阶段" },
+  { name: "/learn hint", description: "查看当前阶段的提问提示" },
+  { name: "/learn complete", description: "完成当前阶段并推进下一步" },
+  { name: "/learn progress", description: "查看学习进度和学习等级" },
+  { name: "/learn recap", description: "查看本轮课堂回顾" },
+  { name: "/learn ask", description: "追问本轮课堂讲解" },
+  { name: "/learn quiz", description: "来一道中文学习小测" },
+  { name: "/learn model", description: "选择 / 设置上课模型" },
+  { name: "/learn level", description: "设置讲解详略（简洁/标准/详细）" },
   { name: "/update",     description: "更新到最新版本" },
   { name: "/help",       description: "显示帮助" },
   { name: "/clear",      description: "清空对话历史" },
@@ -823,6 +1023,12 @@ async function readLineWithPalette(promptStr: string): Promise<string | null> {
           return;
         }
 
+        if (code === 9 && buffer.length === 0) {
+          process.stdout.write("\n");
+          finish("__toggle_mode__");
+          return;
+        }
+
         // Backspace
         if (code === 127 || code === 8) {
           if (buffer.length > 0) {
@@ -943,7 +1149,11 @@ async function readLineRaw(promptStr: string): Promise<string | null> {
 }
 
 // ─── Status line (enhanced purple palette) ──────────────────────────────────
-function statusLine(config: Config): string {
+function statusLine(
+  config: Config,
+  multiConfig: MultiConfig,
+  runtimeState?: SessionRuntimeState,
+): string {
   const label = PROVIDERS[config.providerName]?.label ?? config.providerName;
   const permMode = getPermissionMode();
   const permBadge = permMode === "full-access"
@@ -957,13 +1167,32 @@ function statusLine(config: Config): string {
   const thinkingBadge = supportsThinkingLevel(config.providerName, config.model)
     ? chalk.hex("#22c55e")(`  🧠 ${formatThinkingLevelLabel(effectiveThinkingLevel)}`)
     : "";
+  const learningModel = multiConfig.learning.model?.trim() ?? "";
+  const learningBadge = multiConfig.learning.enabled
+    ? chalk.hex("#22c55e")(learningModel ? `  🎓 上课:${learningModel}` : "  🎓 上课:未配置模型")
+    : "";
+  const activeProject = runtimeState?.currentSession?.learningState.activeProject ?? null;
+  const projectBadge = activeProject
+    ? chalk.hex("#f97316")(`  🎯 ${activeProject.title}`)
+    : "";
+  const mode = runtimeState?.currentSession?.mode ?? runtimeState?.pendingSessionDraft?.mode ?? "build";
+  const modeBadge = mode === "plan"
+    ? chalk.hex("#f59e0b")("  🧭 Plan")
+    : chalk.hex("#38bdf8")("  ⚒ Build");
+  const sessionLabel = runtimeState?.currentSession?.title
+    ?? (runtimeState?.pendingSessionDraft ? "新任务待开始" : "无活动任务");
+  const sessionBadge = chalk.hex("#d8b4fe")(`  🗂 ${sessionLabel}`);
   return (
     chalk.hex("#d8b4fe")("  ◆ ") +
     BRIGHT_PURPLE(label) +
     DEEP_PURPLE(`  [${config.model}]`) +
     thinkingBadge +
+    projectBadge +
+    modeBadge +
+    sessionBadge +
     permBadge +
-    chalk.hex("#6b21a8")("   / 指令菜单 · Esc 中断\n")
+    learningBadge +
+    chalk.hex("#6b21a8")("   / 指令菜单 · Tab 切换 Build/Plan · Esc 中断\n")
   );
 }
 
@@ -1002,95 +1231,102 @@ function runCliUpdate(): boolean {
   return false;
 }
 
-function isTeachingVerbosity(value: string): value is TeachingVerbosity {
-  return value === "简洁" || value === "标准" || value === "详细";
-}
-
-function saveTeachingConfig(
-  multiConfig: MultiConfig,
-  teaching: MultiConfig["teaching"],
-  message: string,
-): { multiConfig: MultiConfig; message: string } {
-  const updated: MultiConfig = {
-    ...multiConfig,
-    teaching,
-  };
-  saveMultiConfig(updated);
-  return { multiConfig: updated, message };
-}
-
-export function handleTeachCommand(
-  input: string,
-  multiConfig: MultiConfig,
-): { multiConfig?: MultiConfig; message: string } {
-  const trimmed = input.trim();
-  const parts = trimmed.split(/\s+/);
-
-  if (parts[0] !== "/teach") {
-    return {
-      message:
-        "  ✗ 用法：/teach | /teach on | /teach off | /teach model <name> | /teach level <简洁|标准|详细>\n",
-    };
-  }
-
-  if (parts.length === 1) {
-    const enabled = !multiConfig.teaching.enabled;
-    return saveTeachingConfig(
-      multiConfig,
-      { ...multiConfig.teaching, enabled },
-      `  ✓ 教育模式已${enabled ? "开启" : "关闭"}\n`,
-    );
-  }
-
-  if (parts[1] === "on" && parts.length === 2) {
-    return saveTeachingConfig(
-      multiConfig,
-      { ...multiConfig.teaching, enabled: true },
-      "  ✓ 教育模式已开启\n",
-    );
-  }
-
-  if (parts[1] === "off" && parts.length === 2) {
-    return saveTeachingConfig(
-      multiConfig,
-      { ...multiConfig.teaching, enabled: false },
-      "  ✓ 教育模式已关闭\n",
-    );
-  }
-
-  if (parts[1] === "model") {
-    const model = parts.slice(2).join(" ").trim();
-    if (!model) {
-      return {
-        message: "  ✗ 用法：/teach model <name>\n",
-      };
-    }
-
-    return saveTeachingConfig(
-      multiConfig,
-      { ...multiConfig.teaching, model },
-      `  ✓ 教学模型已设置为 ${model}\n`,
-    );
-  }
-
-  if (parts[1] === "level") {
-    const level = parts.slice(2).join(" ").trim();
-    if (!isTeachingVerbosity(level)) {
-      return {
-        message: `  ✗ 无效的教学详略：${level || "(空)"}。可选：简洁 / 标准 / 详细\n`,
-      };
-    }
-
-    return saveTeachingConfig(
-      multiConfig,
-      { ...multiConfig.teaching, verbosity: level },
-      `  ✓ 教学详略已设置为 ${level}\n`,
-    );
-  }
+function createTeachingContextCollector() {
+  const toolCalls: Array<{ toolName: string; args: unknown }> = [];
+  const toolResults: Array<{ toolName: string; result: string }> = [];
+  const toolErrors: Array<{ toolName: string; error: string }> = [];
+  const agentErrors: string[] = [];
+  let agentTextSummary = "";
+  let interrupted = false;
 
   return {
-    message:
-      "  ✗ 用法：/teach | /teach on | /teach off | /teach model <name> | /teach level <简洁|标准|详细>\n",
+    capture(event: Parameters<AgentEventBus["emit"]>[0]) {
+      if (event.type === "tool-call") {
+        toolCalls.push({ toolName: event.toolName, args: event.args });
+      }
+      if (event.type === "tool-result") {
+        toolResults.push({ toolName: event.toolName, result: event.result });
+      }
+      if (event.type === "tool-error") {
+        toolErrors.push({ toolName: event.toolName, error: event.error });
+      }
+      if (event.type === "text-delta") {
+        agentTextSummary += event.delta;
+      }
+      if (event.type === "error") {
+        agentErrors.push(event.message);
+      }
+      if (event.type === "run-end") {
+        interrupted = event.interrupted;
+      }
+    },
+    build(userPrompt: string, options?: {
+      promptReview?: TeachingContext["promptReview"];
+      projectSnapshot?: TeachingContext["projectSnapshot"];
+    }): TeachingContext {
+      return {
+        userPrompt,
+        toolCalls,
+        toolResults,
+        toolErrors,
+        agentErrors,
+        interrupted,
+        agentTextSummary: agentTextSummary.slice(0, 500),
+        promptReview: options?.promptReview ?? null,
+        projectSnapshot: options?.projectSnapshot ?? null,
+      };
+    },
+  };
+}
+
+async function chooseLearnMenuAction(multiConfig: MultiConfig): Promise<LearnMenuAction> {
+  return select({
+    message: PURPLE("◆ 学习中心"),
+    choices: [
+      { name: multiConfig.learning.enabled ? "关闭上课模式" : "开启上课模式", value: "toggle" },
+      { name: "启动引导项目", value: "start" },
+      { name: "查看当前阶段", value: "next" },
+      { name: "查看阶段提示", value: "hint" },
+      { name: "完成当前阶段", value: "complete" },
+      { name: "查看学习进度", value: "progress" },
+      { name: "查看本轮回顾", value: "recap" },
+      { name: "追问本轮讲解", value: "ask" },
+      { name: "来一道小测", value: "quiz" },
+      { name: "设置上课模型", value: "model" },
+      { name: "设置讲解详略", value: "level" },
+      { name: "返回", value: "close" },
+    ],
+  }) as Promise<LearnMenuAction>;
+}
+
+function formatLearningRecap(state: LearningSessionState): string {
+  return formatLessonRecap(state.lastLesson);
+}
+
+function formatLearningProgressSummary(profile: LearningProfile, state: LearningSessionState): string {
+  return `${formatLearningProgress(profile).trimEnd()}\n${formatLearningProjectCurrent(state.activeProject).trimEnd()}\n`;
+}
+
+async function runLearningQuiz(profile: LearningProfile): Promise<{
+  message: string;
+  profile?: LearningProfile;
+}> {
+  const question = selectLearningQuizQuestion(profile);
+  console.log(formatLearningQuizPrompt(question));
+
+  const answer = await input({
+    message: PURPLE("◆ 你的答案") + GRAY(" (一句话即可)"),
+  });
+
+  if (!answer.trim()) {
+    return { message: "  本次未作答，小测已取消。\n" };
+  }
+
+  const result = evaluateLearningQuizAnswer(profile, question, answer);
+  saveLearningProfile(result.profile);
+  return {
+    message: result.message,
+    profile: result.profile,
   };
 }
 
@@ -1191,7 +1427,6 @@ async function main() {
     return;
   }
 
-  // ── Single-shot mode ──────────────────────────────────────────────────────
   if (args.length > 0) {
     const update = await checkForAvailableUpdate(currentVersion, "always");
     if (update) printUpdateNotice(update, false);
@@ -1200,15 +1435,18 @@ async function main() {
     const codexReady = config.providerName === "codex" && (isCodexLoggedIn() || !!config.apiKey);
     if (!config.apiKey && config.providerName !== "ollama" && config.providerName !== "copilot" && !codexReady) {
       console.error(RED("❌ 未配置 API Key。请先运行 sharkcode 并输入 / 配置 Provider。"));
-      process.exit(1);
+      process.exitCode = 1;
+      return;
     }
+
     console.log(
       chalk.hex("#c084fc")("\n🦈 SharkCode") +
       chalk.hex("#7c3aed")(` │ `) +
       chalk.hex("#a855f7")(`${PROVIDERS[config.providerName]?.label ?? config.providerName}`) +
       chalk.hex("#7c3aed")(` │ `) +
-      chalk.hex("#d8b4fe")(`${config.model}\n`)
+      chalk.hex("#d8b4fe")(`${config.model}\n`),
     );
+
     const singleInput = args.join(" ");
     const parsed = parseImagesFromInput(singleInput);
     const userContent = buildUserContent(parsed);
@@ -1222,7 +1460,6 @@ async function main() {
     return;
   }
 
-  // ── Interactive REPL mode ─────────────────────────────────────────────────
   console.log(BANNER);
   console.log(chalk.hex("#7c3aed")(`  v${currentVersion}`) + chalk.hex("#3b0764")("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━") + "\n");
   let availableUpdate = await checkForAvailableUpdate(currentVersion, "always");
@@ -1231,22 +1468,24 @@ async function main() {
   }
 
   let multiConfig = readMultiConfig();
-  let config      = resolveConfig(multiConfig);
+  let config = resolveConfig(multiConfig);
+  let learningProfile = readLearningProfile();
+  let sessionRuntime: SessionRuntimeState = {
+    currentSession: null,
+    pendingSessionDraft: createSessionDraft(),
+  };
+  let learningSessionState = createLearningSessionState();
 
-  // Apply saved permission mode
   setPermissionMode(multiConfig.permissionMode ?? "prompt");
+  try { process.stdin.setRawMode(true); process.stdin.resume(); } catch {}
 
-  // Set raw mode ONCE for the entire REPL session.
-  // readLineRaw only manages listeners; raw mode stays on throughout.
-  try { process.stdin.setRawMode(true); process.stdin.resume(); } catch { /* not a TTY */ }
-
-  console.log(statusLine(config));
+  console.log(statusLine(config, multiConfig, sessionRuntime));
 
   if (!config.apiKey && config.providerName !== "ollama" && config.providerName !== "copilot" &&
       !(config.providerName === "codex" && isCodexLoggedIn())) {
     console.log(
       YELLOW("  ⚠ 尚未配置 API Key。") +
-      GRAY("输入 / 然后选择「切换 / 配置 Provider」\n")
+      GRAY("输入 / 然后选择「切换 / 配置 Provider」\n"),
     );
   }
 
@@ -1254,87 +1493,277 @@ async function main() {
 
   while (true) {
     const raw = await readLineWithPalette("\n" + chalk.hex("#7c3aed")("❯ "));
+    if (raw === null) {
+      console.log(GRAY("\nBye! 🦈"));
+      break;
+    }
 
-    if (raw === null) { console.log(GRAY("\nBye! 🦈")); break; }
+    if (raw === "__toggle_mode__") {
+      const activeMode = sessionRuntime.currentSession?.mode ?? sessionRuntime.pendingSessionDraft?.mode ?? "build";
+      const nextMode: SessionMode = activeMode === "plan" ? "build" : "plan";
+
+      if (sessionRuntime.currentSession) {
+        sessionRuntime.currentSession = saveSession({
+          ...sessionRuntime.currentSession,
+          mode: nextMode,
+        });
+      } else {
+        sessionRuntime = {
+          ...sessionRuntime,
+          pendingSessionDraft: {
+            mode: nextMode,
+            activeSkills: sessionRuntime.pendingSessionDraft?.activeSkills ?? [],
+          },
+        };
+      }
+
+      console.log(GREEN(`  ✓ 已切换到 ${nextMode === "plan" ? "Plan" : "Build"} 模式\n`));
+      console.log(statusLine(config, multiConfig, sessionRuntime));
+      continue;
+    }
 
     const trimmed = raw.trim();
     if (!trimmed) continue;
 
-    // Exit shortcuts
-    if (trimmed === "exit" || trimmed === "quit" || trimmed === "/exit") { console.log(GRAY("Bye! 🦈")); break; }
+    if (trimmed === "exit" || trimmed === "quit" || trimmed === "/exit") {
+      console.log(GRAY("Bye! 🦈"));
+      break;
+    }
 
-    // /clear — clear history (also available from palette)
     if (trimmed === "/clear") {
+      sessionRuntime = {
+        currentSession: null,
+        pendingSessionDraft: createSessionDraft(),
+      };
       messages = [];
-      console.log(GRAY("\n  ✓ 对话已清空\n"));
+      learningSessionState = createLearningSessionState();
+      console.log(GRAY("\n  ✓ 已退出当前 session\n"));
+      console.log(statusLine(config, multiConfig, sessionRuntime));
       continue;
     }
 
-    // Bare "/" → command menu
     if (trimmed === "/") {
       const r = await showCommandMenu(multiConfig);
-      multiConfig = r.multiConfig; config = r.config;
+      multiConfig = r.multiConfig;
+      config = r.config;
       if (r.clearHistory) messages = [];
       if (r.exit) break;
-      // Restore raw mode after inquirer (which may have changed it)
-      try { process.stdin.setRawMode(true); process.stdin.resume(); } catch {}
-      console.log(statusLine(config));
+      restoreStdinRawMode();
+      console.log(statusLine(config, multiConfig, sessionRuntime));
       continue;
     }
 
-    // /provider, /model, /key → setup flow directly
-    if (
-      trimmed === "/provider" || trimmed.startsWith("/provider ") ||
-      trimmed === "/model"    || trimmed.startsWith("/model ")    ||
-      trimmed === "/key"      || trimmed.startsWith("/key ")      ||
-      trimmed === "/thinking" || trimmed.startsWith("/thinking ")
-    ) {
-      const r = trimmed === "/thinking" || trimmed.startsWith("/thinking ")
-        ? await showThinkingSetupFlow(multiConfig)
-        : await showSetupFlow(multiConfig);
-      multiConfig = r.multiConfig; config = r.config;
-      if (r.exit) break;
-      // Restore raw mode after inquirer
-      try { process.stdin.setRawMode(true); process.stdin.resume(); } catch {}
-      console.log(statusLine(config));
-      continue;
-    }
+    if (trimmed === "/session" || trimmed.startsWith("/session ")) {
+      const command = trimmed.split(/\s+/);
 
-    // /login → GitHub Copilot device flow
-    if (trimmed === "/login") {
-      const r = await runCopilotLogin(multiConfig);
-      multiConfig = r.multiConfig; config = r.config;
-      try { process.stdin.setRawMode(true); process.stdin.resume(); } catch {}
-      console.log(statusLine(config));
-      continue;
-    }
-
-    // /logout → clear Copilot / Codex credentials
-    if (trimmed === "/logout") {
-      const logoutTarget = multiConfig.activeProvider === "codex" ? "codex" : "copilot";
-      if (logoutTarget === "codex") {
-        clearCodexAuth();
-        console.log(GRAY("\n  ✓ OpenAI Codex 登录已清除\n"));
-        const updated: MultiConfig = { ...multiConfig, activeProvider: "deepseek" };
-        saveMultiConfig(updated);
-        multiConfig = updated; config = resolveConfig(updated);
-        console.log(GRAY(`  已自动切换回 ${PROVIDERS.deepseek!.label}\n`));
-        console.log(statusLine(config));
-      } else {
-        clearCopilotAuth();
-        console.log(GRAY("\n  ✓ GitHub Copilot 登录已清除\n"));
-        if (multiConfig.activeProvider === "copilot") {
-          const updated: MultiConfig = { ...multiConfig, activeProvider: "deepseek" };
-          saveMultiConfig(updated);
-          multiConfig = updated; config = resolveConfig(updated);
-          console.log(GRAY(`  已自动切换回 ${PROVIDERS.deepseek!.label}\n`));
-          console.log(statusLine(config));
-        }
+      if (command[1] === "new" || trimmed === "/session") {
+        sessionRuntime = {
+          currentSession: null,
+          pendingSessionDraft: createSessionDraft(),
+        };
+        messages = [];
+        learningSessionState = createLearningSessionState();
+        console.log(GREEN("  ✓ 已进入新任务待开始状态\n"));
+        console.log(statusLine(config, multiConfig, sessionRuntime));
+        continue;
       }
+
+      if (command[1] === "list") {
+        const sessions = listSessionSummaries();
+        if (sessions.length === 0) {
+          console.log("\n  🗂 暂无历史 session。\n");
+        } else {
+          console.log(["", "  🗂 历史 session", ...sessions.map((session) => `  - ${session.id} | ${session.title} | ${session.updatedAt} | ${session.mode}`), ""].join("\n"));
+        }
+        continue;
+      }
+
+      if (command[1] === "current") {
+        const current = sessionRuntime.currentSession;
+        if (!current) {
+          console.log("\n  🗂 当前没有活动任务。\n");
+        } else {
+          console.log(["", "  🗂 当前任务", `  id：${current.id}`, `  标题：${current.title}`, `  模式：${current.mode}`, `  更新时间：${current.updatedAt}`, ""].join("\n"));
+        }
+        continue;
+      }
+
+      if (command[1] === "switch") {
+        const id = command.slice(2).join(" ").trim();
+        if (!id) {
+          console.log("  ✗ 用法：/session switch <id>\n");
+          continue;
+        }
+
+        const nextSession = readSession(id);
+        if (!nextSession) {
+          console.log(`  ✗ 未找到 session：${id}\n`);
+          continue;
+        }
+
+        sessionRuntime = {
+          currentSession: nextSession,
+          pendingSessionDraft: null,
+        };
+        messages = nextSession.messages;
+        learningSessionState = nextSession.learningState;
+        console.log(GREEN(`  ✓ 已切换到 session：${nextSession.title}\n`));
+        console.log(statusLine(config, multiConfig, sessionRuntime));
+        continue;
+      }
+
+      console.log("  ✗ 用法：/session | /session new | /session list | /session current | /session switch <id>\n");
       continue;
     }
 
-    if (trimmed === "/update") {      if (!availableUpdate) {
+    if (trimmed === "/mode" || trimmed.startsWith("/mode ")) {
+      const next = trimmed.split(/\s+/)[1];
+      if (next !== "build" && next !== "plan") {
+        console.log("  ✗ 用法：/mode <build|plan>\n");
+        continue;
+      }
+
+      if (sessionRuntime.currentSession) {
+        sessionRuntime.currentSession = saveSession({
+          ...sessionRuntime.currentSession,
+          mode: next,
+        });
+      } else {
+        sessionRuntime = {
+          ...sessionRuntime,
+          pendingSessionDraft: {
+            mode: next,
+            activeSkills: sessionRuntime.pendingSessionDraft?.activeSkills ?? [],
+          },
+        };
+      }
+
+      console.log(GREEN(`  ✓ 已切换到 ${next === "plan" ? "Plan" : "Build"} 模式\n`));
+      console.log(statusLine(config, multiConfig, sessionRuntime));
+      continue;
+    }
+
+    if (trimmed === "/skill" || trimmed.startsWith("/skill ")) {
+      const command = trimmed.split(/\s+/);
+      const activeSkills = sessionRuntime.currentSession?.activeSkills ?? sessionRuntime.pendingSessionDraft?.activeSkills ?? [];
+
+      if (command.length === 1 || command[1] === "list") {
+        const skills = listAvailableSkills();
+        console.log([
+          "",
+          "  🧩 可用 skills",
+          ...(skills.length === 0
+            ? ["  - 暂无自定义 skill"]
+            : skills.map((skill) => `  - ${skill.id} [${skill.source}]${activeSkills.includes(skill.id) ? "  (当前)" : ""}: ${skill.description}`)),
+          "",
+        ].join("\n"));
+        continue;
+      }
+
+      if (command[1] === "current") {
+        const context = resolveSkillContext(activeSkills, sessionRuntime.currentSession?.mode ?? sessionRuntime.pendingSessionDraft?.mode ?? "build");
+        console.log([
+          "",
+          "  🧩 当前 skills",
+          ...(context.skills.length === 0 ? ["  - 暂无"] : context.skills.map((skill) => `  - ${skill.id}`)),
+          "",
+        ].join("\n"));
+        continue;
+      }
+
+      if (command[1] === "clear") {
+        if (sessionRuntime.currentSession) {
+          sessionRuntime.currentSession = saveSession({
+            ...sessionRuntime.currentSession,
+            activeSkills: [],
+          });
+        } else {
+          sessionRuntime = {
+            ...sessionRuntime,
+            pendingSessionDraft: {
+              mode: sessionRuntime.pendingSessionDraft?.mode ?? "build",
+              activeSkills: [],
+            },
+          };
+        }
+        console.log(GREEN("  ✓ 已清空当前 session 的 skills\n"));
+        continue;
+      }
+
+      if (command[1] === "use") {
+        const skillId = normalizeSkillId(command.slice(2).join(" "));
+        if (!skillId) {
+          console.log("  ✗ 用法：/skill use <name>\n");
+          continue;
+        }
+
+        const skill = findAvailableSkill(skillId);
+        if (!skill) {
+          console.log(`  ✗ 未找到 skill：${skillId}\n`);
+          continue;
+        }
+
+        const nextSkills = Array.from(new Set([...activeSkills, skill.id]));
+        if (sessionRuntime.currentSession) {
+          sessionRuntime.currentSession = saveSession({
+            ...sessionRuntime.currentSession,
+            activeSkills: nextSkills,
+          });
+        } else {
+          sessionRuntime = {
+            ...sessionRuntime,
+            pendingSessionDraft: {
+              mode: sessionRuntime.pendingSessionDraft?.mode ?? "build",
+              activeSkills: nextSkills,
+            },
+          };
+        }
+        console.log(GREEN(`  ✓ 已启用 skill：${skill.id}\n`));
+        continue;
+      }
+
+      console.log("  ✗ 用法：/skill | /skill list | /skill use <name> | /skill current | /skill clear\n");
+      continue;
+    }
+
+    if (trimmed === "/provider" || trimmed.startsWith("/provider ")) {
+      const r = await showSetupFlow(multiConfig);
+      multiConfig = r.multiConfig;
+      config = r.config;
+      if (r.exit) break;
+      restoreStdinRawMode();
+      console.log(statusLine(config, multiConfig, sessionRuntime));
+      continue;
+    }
+
+    if (trimmed === "/model" || trimmed.startsWith("/model ")) {
+      const r = await showModelSwitchFlow(multiConfig);
+      multiConfig = r.multiConfig;
+      config = r.config;
+      restoreStdinRawMode();
+      console.log(statusLine(config, multiConfig, sessionRuntime));
+      continue;
+    }
+
+    if (trimmed === "/thinking" || trimmed.startsWith("/thinking ")) {
+      const r = await showThinkingSetupFlow(multiConfig);
+      multiConfig = r.multiConfig;
+      config = r.config;
+      try { process.stdin.setRawMode(true); process.stdin.resume(); } catch {}
+      console.log(statusLine(config, multiConfig, sessionRuntime));
+      continue;
+    }
+
+    if (trimmed === "/permission") {
+      const r = await togglePermissionMode(multiConfig);
+      multiConfig = r.multiConfig;
+      config = r.config;
+      console.log(statusLine(config, multiConfig, sessionRuntime));
+      continue;
+    }
+
+    if (trimmed === "/update") {
+      if (!availableUpdate) {
         console.log(GRAY("  当前未检测到可更新版本，仍将尝试安装 sharkcode@latest ...\n"));
       }
 
@@ -1346,40 +1775,39 @@ async function main() {
     }
 
     if (trimmed === "/help") {
-      const copilotStatus = isCopilotLoggedIn() ? GREEN("✓ 已登录") : GRAY("未登录");
-      const codexStatus   = isCodexLoggedIn()   ? GREEN("✓ 已登录") : GRAY("未登录");
-
       console.log(`
 ${PURPLE("  可用命令：")}
+  ${GRAY("/session")}      ${GRAY("─ 查看 / 切换历史任务")}
+  ${GRAY("/session new")}  ${GRAY("─ 开始一个新任务")}
+  ${GRAY("/session list")} ${GRAY("─ 列出历史任务")}
+  ${GRAY("/session current")} ${GRAY("─ 查看当前任务")}
+  ${GRAY("/mode")}         ${GRAY("─ 切换 Build / Plan 模式")}
+  ${GRAY("/skill")}        ${GRAY("─ 查看 / 启用技能")}
   ${GRAY("/")}             ${GRAY("─ 打开指令菜单")}
   ${GRAY("/provider")}     ${GRAY("─ 切换 / 配置 Provider（含订阅登录）")}
   ${GRAY("/model")}        ${GRAY("─ 切换模型")}
-  ${GRAY("/thinking")}     ${GRAY("─ 调整 OpenAI / Codex / Copilot 思考水平")}
-  ${GRAY("/teach")}        ${GRAY("─ 开启/关闭教育模式")}
-  ${GRAY("/login")}        ${GRAY("─ Copilot 快捷登录")} ${copilotStatus}
-  ${GRAY("/logout")}       ${GRAY("─ 退出 Copilot / Codex 登录")}
+  ${GRAY("/thinking")}     ${GRAY("─ 调整思考水平")}
+  ${GRAY("/permission")}   ${GRAY("─ 切换权限模式（默认 / Full Access）")}
+  ${GRAY("/learn")}        ${GRAY("─ 打开学习中心 / 开启或关闭上课模式")}
   ${GRAY("/update")}       ${GRAY("─ 更新到最新版本")}
   ${GRAY("/help")}         ${GRAY("─ 显示此帮助")}
   ${GRAY("exit / quit")}   ${GRAY("─ 退出")}
   ${GRAY("Esc")}           ${GRAY("─ 中断当前 Agent 输出")}
 
-${PURPLE("  订阅登录 — GitHub Copilot：")} ${copilotStatus}
-  ${GRAY("输入 /provider → 选择 copilot → 直接弹出浏览器授权码")}
-  ${GRAY("也可以输入 /login 快速进入授权流程")}
-  ${GRAY("授权后直接使用 GitHub Copilot 订阅，无需 API Key")}
-  ${GRAY("部分 Copilot 推理模型支持 /thinking 调整思考强度")}
-
-${PURPLE("  订阅登录 — OpenAI Codex：")} ${codexStatus}
-  ${GRAY("输入 /provider → 选择 codex → 选择「通过浏览器授权」")}
-  ${GRAY("授权后使用 ChatGPT Plus/Pro/Codex 订阅，无需 API Key")}
-  ${GRAY("也可以直接输入 OpenAI API Key 使用标准 API")}
-
-${PURPLE("  教育模式：")}
-  ${GRAY("/teach")}                 ${GRAY("─ 开启/关闭教育模式")}
-  ${GRAY("/teach on")}              ${GRAY("─ 显式开启教育模式")}
-  ${GRAY("/teach off")}             ${GRAY("─ 关闭教育模式")}
-  ${GRAY("/teach model <name>")}    ${GRAY("─ 设置教学模型（如 gpt-4o-mini）")}
-  ${GRAY("/teach level <level>")}   ${GRAY("─ 设置教学详略：简洁 / 标准 / 详细")}
+${PURPLE("  上课模式：")}
+  ${GRAY("/learn")}                 ${GRAY("─ 打开学习中心")}
+  ${GRAY("/learn on")}              ${GRAY("─ 显式开启上课模式")}
+  ${GRAY("/learn off")}             ${GRAY("─ 关闭上课模式")}
+  ${GRAY("/learn start [项目描述]")} ${GRAY("─ 启动一个引导式 Vibe Coding 项目")}
+  ${GRAY("/learn next")}            ${GRAY("─ 查看当前引导阶段")}
+  ${GRAY("/learn hint")}            ${GRAY("─ 查看当前阶段推荐提问方式")}
+  ${GRAY("/learn complete")}        ${GRAY("─ 完成当前阶段并推进下一步")}
+  ${GRAY("/learn progress")}        ${GRAY("─ 查看学习进度和学习等级")}
+  ${GRAY("/learn recap")}           ${GRAY("─ 查看本轮课堂讲解")}
+  ${GRAY("/learn ask [问题]")}      ${GRAY("─ 追问本轮课堂讲解")}
+  ${GRAY("/learn quiz")}            ${GRAY("─ 来一道中文学习小测")}
+  ${GRAY("/learn model [name]")}    ${GRAY("─ 选择 / 设置上课模型")}
+  ${GRAY("/learn level <level>")}   ${GRAY("─ 设置讲解详略：简洁 / 标准 / 详细")}
 
 ${PURPLE("  可用工具 (Agent 自动调用)：")}
   ${CYAN("read_file")}     ${GRAY("─ 读取文件（支持行号范围）")}
@@ -1400,7 +1828,7 @@ ${PURPLE("  图片输入：")}
   ${GRAY("支持格式: .png .jpg .jpeg .gif .webp .bmp .svg")}
 
 ${PURPLE("  版本更新：")}
-  ${GRAY("启动时如果有新版本，会像 Codex 一样直接显示更新提示")}
+  ${GRAY("启动时如果有新版本，会直接显示更新提示")}
   ${GRAY("在交互模式中输入 /update 可立即执行升级")}
 
 ${PURPLE("  项目配置：")}
@@ -1409,36 +1837,203 @@ ${PURPLE("  项目配置：")}
       continue;
     }
 
-    // /teach — toggle/configure educational mode
-    if (trimmed === "/teach" || trimmed.startsWith("/teach ")) {
-      const result = handleTeachCommand(trimmed, multiConfig);
+    if (trimmed === "/learn" || trimmed.startsWith("/learn ")) {
+      const result = await handleLearnCommand(trimmed, multiConfig, {
+        chooseMenuAction: chooseLearnMenuAction,
+        promptForModelSelection: promptForLearningModelSelection,
+        formatProgress: formatLearningProgressSummary,
+        formatRecap: (state) => formatLearningRecap(state),
+        runQuiz: runLearningQuiz,
+        profile: learningProfile,
+        sessionState: learningSessionState,
+        saveConfig: saveMultiConfig,
+      });
+      restoreStdinRawMode();
       if (result.multiConfig) {
         multiConfig = result.multiConfig;
         config = resolveConfig(result.multiConfig);
       }
+      if (result.profile) {
+        learningProfile = result.profile;
+      }
+
+      if (result.showProjectCurrent) {
+        console.log(formatLearningProjectCurrent(learningSessionState.activeProject));
+        continue;
+      }
+
+      if (result.showProjectHint) {
+        console.log(formatLearningProjectHint(learningSessionState.activeProject));
+        continue;
+      }
+
+      if (result.completeProject) {
+        const advanced = advanceLearningProject(learningSessionState);
+        learningSessionState = advanced.sessionState;
+        if (sessionRuntime.currentSession) {
+          sessionRuntime.currentSession = saveSession({
+            ...sessionRuntime.currentSession,
+            learningState: learningSessionState,
+            providerName: config.providerName,
+            model: config.model,
+            learningModel: multiConfig.learning.model?.trim(),
+          });
+        }
+        console.log(advanced.message);
+        continue;
+      }
+
+      if (typeof result.startProjectDescription === "string") {
+        const lessonModel = multiConfig.learning.model?.trim();
+        if (!lessonModel) {
+          console.log("\n  🎓 尚未设置上课模型。请先使用 /learn model <name>。\n");
+          continue;
+        }
+
+        let description = result.startProjectDescription.trim();
+        if (!description) {
+          let prompted = "";
+          try {
+            prompted = await input({
+              message: PURPLE("◆ 你想做什么项目") + GRAY(" (一句话描述即可)"),
+            });
+          } catch {
+            restoreStdinRawMode();
+            console.log("  取消\n");
+            continue;
+          }
+          restoreStdinRawMode();
+          description = prompted.trim();
+        }
+
+        if (!description) {
+          console.log("  取消\n");
+          continue;
+        }
+
+        try {
+          const project = await withSpinner("正在生成项目计划...", () =>
+            planLearningProject({
+              description,
+              learning: multiConfig.learning,
+              model: lessonModel,
+              getProvider: () => createProviderAsync({ ...config, model: lessonModel }),
+            })
+          );
+          learningSessionState = rememberLearningProject(learningSessionState, project);
+          if (sessionRuntime.currentSession) {
+            sessionRuntime.currentSession = saveSession({
+              ...sessionRuntime.currentSession,
+              learningState: learningSessionState,
+              providerName: config.providerName,
+              model: config.model,
+              learningModel: lessonModel,
+            });
+          }
+          console.log(formatLearningProjectLaunch(project));
+        } catch (error) {
+          console.log(RED(`\n  ✗ ${String(error)}\n`));
+        }
+        continue;
+      }
+
+      if (typeof result.askQuestion === "string") {
+        if (!sessionRuntime.currentSession) {
+          console.log("\n  🎓 当前没有活动 session，先开始一个任务或切换历史 session。\n");
+          continue;
+        }
+
+        const lessonModel = multiConfig.learning.model?.trim();
+        if (!lessonModel) {
+          console.log("\n  🎓 尚未设置上课模型。请先使用 /learn model <name>。\n");
+          continue;
+        }
+
+        let question = result.askQuestion.trim();
+        if (!question) {
+          let prompted = "";
+          try {
+            prompted = await input({
+              message: PURPLE("◆ 继续追问") + GRAY(" (直接输入问题)"),
+            });
+          } catch {
+            restoreStdinRawMode();
+            console.log("  取消\n");
+            continue;
+          }
+          restoreStdinRawMode();
+          question = prompted.trim();
+        }
+
+        if (!question) {
+          console.log("  取消\n");
+          continue;
+        }
+
+        try {
+          const answer = await withSpinner("正在回答追问...", () =>
+            answerLearningFollowUp({
+              question,
+              learning: multiConfig.learning,
+              model: lessonModel,
+              sessionState: learningSessionState,
+              getProvider: () => createProviderAsync({ ...config, model: lessonModel }),
+            })
+          );
+          learningSessionState = rememberLearningFollowUp(learningSessionState, question, answer);
+          sessionRuntime.currentSession = saveSession({
+            ...sessionRuntime.currentSession,
+            learningState: learningSessionState,
+            learningModel: lessonModel,
+            providerName: config.providerName,
+            model: config.model,
+          });
+          console.log(formatLearningFollowUpAnswer(answer));
+        } catch (error) {
+          console.log(RED(`\n  ✗ ${String(error)}\n`));
+        }
+        continue;
+      }
+
       console.log(result.message);
       continue;
     }
 
-    // Unknown slash command
     if (trimmed.startsWith("/")) {
       console.log(GRAY("  未知命令。输入 / 调出指令菜单\n"));
       continue;
     }
 
-    // ── Send message to agent ──────────────────────────────────────────────
     const isCodexReady = config.providerName === "codex" && (isCodexLoggedIn() || !!config.apiKey);
     if (!config.apiKey && config.providerName !== "ollama" && config.providerName !== "copilot" && !isCodexReady) {
       console.log(YELLOW("  ⚠ 还未填写 API Key。输入 / → 切换 / 配置 Provider\n"));
       continue;
     }
 
-    // ── Parse images from input and send message to agent ────────────────────
     const parsed = parseImagesFromInput(trimmed);
     const userContent = buildUserContent(parsed);
 
+    if (!sessionRuntime.currentSession) {
+      const draft = sessionRuntime.pendingSessionDraft ?? createSessionDraft();
+      const created = saveSession(createSessionFromPrompt({
+        prompt: trimmed,
+        mode: draft.mode,
+        activeSkills: draft.activeSkills,
+        providerName: config.providerName,
+        model: config.model,
+        learningModel: multiConfig.learning.model?.trim(),
+      }));
+      sessionRuntime = {
+        currentSession: created,
+        pendingSessionDraft: null,
+      };
+      const detached = createDetachedSessionState(created);
+      messages = detached.messages;
+      learningSessionState = detached.learningState;
+    }
+
     if (parsed.loadedPaths.length > 0) {
-      console.log(GRAY(`  📎 已加载 ${parsed.loadedPaths.length} 张图片: ${parsed.loadedPaths.map(p => p.split(/[/\\]/).pop()).join(", ")}`));
+      console.log(GRAY(`  📎 已加载 ${parsed.loadedPaths.length} 张图片: ${parsed.loadedPaths.map((p) => p.split(/[/\\]/).pop()).join(", ")}`));
     }
     if (parsed.failedPaths.length > 0) {
       console.log(YELLOW(`  ⚠ 无法读取: ${parsed.failedPaths.join(", ")}`));
@@ -1446,102 +2041,131 @@ ${PURPLE("  项目配置：")}
 
     messages.push({ role: "user", content: userContent });
 
-    // Set up interrupt: listen for Escape key while agent is running
     const abortSignal = createInterruptController();
     const interruptListener = (chunk: Buffer) => {
-      const str = chunk.toString("utf8");
-      // Escape key = \x1b (but NOT escape sequences like arrow keys which are \x1b[...)
-      // We check for bare Escape: exactly 1 byte = 0x1b
-      if (str === "\x1b") {
+      if (chunk.toString("utf8") === "\x1b") {
         triggerInterrupt();
       }
     };
     process.stdin.on("data", interruptListener);
 
-    const teachingEnabled = multiConfig.teaching.enabled;
-    const fallbackCheck = canUseEducationalMode({
-      teachingEnabled,
-      isTTY: process.stdout.isTTY,
-      terminalWidth: process.stdout.columns,
+    const collector = createTeachingContextCollector();
+    const eventBus = new AgentEventBus();
+    let didReceiveRunEnd = false;
+    eventBus.subscribe((event) => {
+      collector.capture(event);
+      if (event.type === "run-end") {
+        didReceiveRunEnd = true;
+      }
     });
 
-    let educationalApp: { unmount: () => void } | null = null;
-    let eventBus: AgentEventBus | undefined;
-
-    if (fallbackCheck.canUse) {
-      const teachingModel = multiConfig.teaching.model ?? config.model;
-      const teachingConfig = { ...config, model: teachingModel };
-
-      eventBus = new AgentEventBus();
-      const teachingOrchestrator = new TeachingOrchestrator({
-        model: teachingModel,
-        verbosity: multiConfig.teaching.verbosity,
-        getProvider: () => createProvider(teachingConfig),
-      });
-
-      const toolCalls: Array<{ toolName: string; args: unknown }> = [];
-      const toolResults: Array<{ toolName: string; result: string }> = [];
-      let agentTextSummary = "";
-
-      const unsubscribeContext = eventBus.subscribe((event) => {
-        if (event.type === "tool-call") {
-          toolCalls.push({ toolName: event.toolName, args: event.args });
-        }
-        if (event.type === "tool-result") {
-          toolResults.push({ toolName: event.toolName, result: event.result });
-        }
-        if (event.type === "text-delta") {
-          agentTextSummary += event.delta;
-        }
-        if (event.type === "run-end") {
-          unsubscribeContext();
-          void teachingOrchestrator.teach({
-            userPrompt: trimmed,
-            toolCalls,
-            toolResults,
-            agentTextSummary: agentTextSummary.slice(0, 500),
-          }, abortSignal);
-        }
-      });
-
-      educationalApp = startEducationalApp(eventBus, teachingOrchestrator, {
-        onExit: () => {
-          educationalApp?.unmount();
-          educationalApp = null;
-        },
-      });
-    } else if (teachingEnabled && fallbackCheck.reason) {
-      printFallbackNotice(fallbackCheck.reason);
-    }
-
     try {
-      const result = await runAgent(messages, config, abortSignal, eventBus);
-      messages = result.messages;
-
-      if (result.interrupted) {
-        process.stderr.write(
-          GRAY("  按 Esc 已中断 · 可以继续输入新指令\n")
+      try {
+        const skillContext = resolveSkillContext(
+          sessionRuntime.currentSession?.activeSkills ?? [],
+          sessionRuntime.currentSession?.mode ?? "build",
         );
+        const result = await runAgent(messages, config, abortSignal, eventBus, true, {
+          runtimePolicy: skillContext.runtimePolicy,
+          systemReminders: skillContext.systemReminders,
+        });
+        messages = result.messages;
+        if (sessionRuntime.currentSession) {
+          sessionRuntime.currentSession = saveSession({
+            ...sessionRuntime.currentSession,
+            messages,
+            learningState: learningSessionState,
+            providerName: config.providerName,
+            model: config.model,
+            learningModel: multiConfig.learning.model?.trim(),
+          });
+        }
+
+        if (result.interrupted) {
+          process.stderr.write(GRAY("  按 Esc 已中断 · 可以继续输入新指令\n"));
+        }
+      } catch (err) {
+        eventBus.emit({ type: "error", message: String(err) });
+        didReceiveRunEnd = ensureRunEnd(eventBus, didReceiveRunEnd);
+        console.error(RED(`\n❌ ${String(err)}\n`));
+        messages.pop();
       }
-    } catch (err) {
-      console.error(RED(`\n❌ ${String(err)}\n`));
-      messages.pop();
+
+      if (multiConfig.learning.enabled) {
+        const lessonModel = multiConfig.learning.model?.trim();
+        const promptReview = reviewLearningPrompt({
+          prompt: trimmed,
+          project: learningSessionState.activeProject,
+        });
+        const lessonContext = collector.build(trimmed, {
+          promptReview,
+          projectSnapshot: getLearningProjectSnapshot(learningSessionState.activeProject),
+        });
+        const signal = detectLearningSignal(lessonContext);
+        if (!lessonModel && signal.shouldGenerate) {
+          process.stdout.write("\n  🎓 尚未设置上课模型，课堂讲解已暂停。请先使用 /learn model <name>。\n");
+        }
+        if (signal.shouldGenerate && lessonModel) {
+          const lesson = await withSpinner("正在生成课堂讲解...", () =>
+            generateLearningLesson({
+              context: lessonContext,
+              learning: multiConfig.learning,
+              model: lessonModel,
+              concepts: signal.concepts,
+              getProvider: () => createProviderAsync({ ...config, model: lessonModel }),
+            })
+          );
+
+          if (lesson) {
+            learningSessionState = rememberLearningLesson(learningSessionState, lesson);
+            learningProfile = applyLessonToProfile(learningProfile, lesson, 5);
+            saveLearningProfile(learningProfile);
+            if (sessionRuntime.currentSession) {
+              sessionRuntime.currentSession = saveSession({
+                ...sessionRuntime.currentSession,
+                messages,
+                learningState: learningSessionState,
+                providerName: config.providerName,
+                model: config.model,
+                learningModel: lessonModel,
+              });
+            }
+
+            if (multiConfig.learning.autoCards) {
+              process.stdout.write(formatLessonHint(lesson));
+            }
+          }
+        }
+      }
     } finally {
-      // Always clean up: remove interrupt listener, reset state, restore raw mode
       process.stdin.removeListener("data", interruptListener);
       resetInterrupt();
-      if (educationalApp) {
-        educationalApp.unmount();
-        educationalApp = null;
-      }
-      try { process.stdin.setRawMode(true); process.stdin.resume(); } catch {}
+      restoreStdinRawMode();
     }
   }
 }
 
-if (process.argv[1] && resolvePath(process.argv[1]) === fileURLToPath(import.meta.url)) {
+export function isDirectCliEntrypoint(
+  argv1: string | undefined,
+  moduleUrl: string,
+  resolveRealPath: (path: string) => string = realpathSync,
+): boolean {
+  if (!argv1) {
+    return false;
+  }
+
+  const modulePath = fileURLToPath(moduleUrl);
+
+  try {
+    return resolveRealPath(resolvePath(argv1)) === resolveRealPath(modulePath);
+  } catch {
+    return resolvePath(argv1) === modulePath;
+  }
+}
+
+if (isDirectCliEntrypoint(process.argv[1], import.meta.url)) {
   main().catch((err) => {
     console.error(chalk.red(`Fatal: ${String(err)}`));
-    process.exit(1);
+    process.exitCode = 1;
   });
 }
